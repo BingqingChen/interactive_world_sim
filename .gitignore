@@ -176,3 +176,5 @@ outputs_dp/
 
 lightning_logs/
 optuna_studies/
+
+jobs/logs/
