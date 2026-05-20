@@ -1,0 +1,36 @@
+
+
+	..........::::::::::: Bosch Proxy4Server Access :::::::::::..........
+
+
+	proxy_on  - activates the Bosch Proxy4Server for the current session.
+
+	proxy_off - deactivates the Bosch Proxy4Server.
+
+
+	..............................................................
+
+
+
+
+	..........::::::::::: Bosch Proxy4Server Access :::::::::::..........
+
+
+	proxy_on  - activates the Bosch Proxy4Server for the current session.
+
+	proxy_off - deactivates the Bosch Proxy4Server.
+
+
+	..............................................................
+
+
+/home/che5pi/.conda/envs/iws/lib/python3.11/site-packages/hydra/_internal/defaults_list.py:251: UserWarning: In 'config': Defaults list is missing `_self_`. See https://hydra.cc/docs/1.2/upgrades/1.0_to_1.1/default_composition_order for more information
+  warnings.warn(msg, UserWarning)
+wandb: Using wandb-core as the SDK backend. Please refer to https://wandb.me/wandb-core for more information.
+wandb: WARNING `resume` will be ignored since W&B syncing is set to `offline`. Starting a new run with run id 7qr30zko.
+wandb: Tracking run with wandb version 0.18.0
+wandb: W&B syncing is set to `offline` in this directory.  
+wandb: Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/home/che5pi/.conda/envs/iws/lib/python3.11/site-packages/lightning/pytorch/utilities/model_summary/model_summary.py:242: Precision bf16-mixed is not supported by the model summary.  Estimated model size in MB will not be accurate. Using 32 bits instead.
+/home/che5pi/.conda/envs/iws/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py:534: Found 510 module(s) in eval mode at the start of training. This may lead to unexpected behavior during training. If this is intentional, you can ignore this warning.

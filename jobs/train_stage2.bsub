@@ -2,12 +2,12 @@
 #BSUB -J iws_h200                          # job name
 #BSUB -o jobs/logs/iws_mujoco.%J.out           # stdout log (submit from project root)
 #BSUB -e jobs/logs/iws_mujoco.%J.err           # stderr log
-#BSUB -n 16                                # CPU cores: 8 workers for data loading
+#BSUB -n 4                                # CPU cores: 8 workers for data loading
 #BSUB -R span[hosts=1]                     # single host
-#BSUB -M 32768MB                           # 32 GB system RAM
-#BSUB -gpu "num=1:mig=7"                      # 1× full H200 (143 GB HBM3e)
+#BSUB -M 16384MB                           # 16 GB system RAM
+#BSUB -gpu "num=1"                      # 1× full H200 (143 GB HBM3e)
 #BSUB -W 12:00                             # 12-hour runtime limit
-#BSUB -q batch_h200_mig                    # H200 MIG queue (no backlog)
+#BSUB -q batch_h200                    # H200 MIG queue (no backlog)
 #BSUB -P BH-000557-01  	                   # project to charge, AIQ-103
 #BSUB -G rb_bd_dlp_rng-dl01_cr_AIQ_employees
 
@@ -42,26 +42,29 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd ~/interactive_world_sim
 conda activate iws
 
-python main.py +name=pusht_stage_2 algorithm=latent_world_model \
-  experiment=exp_latent_dyn dataset=sim_aloha_dataset \
-  dataset.dataset_dir=/fs/scratch/rb_bd_dlp_rng-dl01_cr_AIQ_employees/aiq103/iws/data/mujoco \
+FILE_DIR="/fs/scratch/rb_bd_dlp_rng-dl01_cr_AIQ_employees/aiq103/iws"
+
+python main.py +name=robosuite_lift_stage_2 algorithm=latent_world_model \
+  experiment=exp_latent_dyn dataset=sim_robosuite_dataset \
+  dataset.dataset_dir=${FILE_DIR}/data/robosuite/lift \
   dataset.horizon=10 dataset.val_horizon=150 \
-  dataset.obs_keys=[top_pov] \
-  experiment.training.batch_size=96 \
-  experiment.training.precision=bf16-mixed \
+  experiment.training.batch_size=4 \
   experiment.training.max_steps=1000005 \
   experiment.training.log_every_n_steps=100 \
   experiment.validation.limit_batch=1.0 \
-  experiment.validation.batch_size=32 \
+  experiment.validation.batch_size=2 \
   experiment.validation.val_every_n_step=10000 \
-  experiment.validation.precision=bf16-mixed \
   experiment.training.checkpointing.every_n_train_steps=10000 \
-  experiment.training.data.num_workers=16 \
-  experiment.validation.data.num_workers=16 \
+  experiment.training.data.num_workers=4 \
+  experiment.validation.data.num_workers=4 \
   algorithm.latent_dim=512 algorithm.action_dim=4 \
   algorithm.noise_scheduler.loss_weighting=uniform \
   algorithm.sampling_strategy=terminal_only \
-  "algorithm.load_ae='outputs/2026-04-18/00-19-07/checkpoints/epoch=1-step=100000.ckpt'" \
+  algorithm.dyn_infer_steps=3 \
+  "algorithm.load_ae='${FILE_DIR}/outputs/robosuite_lift_stage_1/2026-05-18/20-48-04/checkpoints/epoch=32-step=140000.ckpt'" \
   algorithm.training_stage=2 \
-  "load='outputs/2026-04-21/22-09-12/checkpoints/epoch=2-step=60000.ckpt'"
+  hydra.run.dir=${FILE_DIR}/outputs/\${name}/\${now:%Y-%m-%d}/\${now:%H-%M-%S}
+
+  ## Resume from previous checkpoint 
+  #"load='${FILE_DIR}/outputs/robosuite_lift_stage_2/2026-04-21/22-09-12/checkpoints/epoch=2-step=60000.ckpt'"
 

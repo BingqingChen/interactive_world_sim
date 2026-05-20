@@ -6,7 +6,7 @@
 #BSUB -R span[hosts=1]                     # single host
 #BSUB -M 32768MB                           # 32 GB system RAM
 #BSUB -gpu "num=1"                         # 1× full H200 (143 GB HBM3e)
-#BSUB -W 1:00                             # 1-hour runtime limit
+#BSUB -W 12:00                             # 1-hour runtime limit
 #BSUB -q batch_h200                    # H200 MIG queue (no backlog)
 #BSUB -P BH-000557-01  	                   # project to charge, AIQ-103
 #BSUB -G rb_bd_dlp_rng-dl01_cr_AIQ_employees
@@ -44,9 +44,12 @@ echo "GPU monitor PID: $GPU_MON_PID  →  jobs/logs/gpu_util_${LSB_JOBID}.log"
 cd ~/interactive_world_sim
 conda activate iws
 
+FILE_DIR="/fs/scratch/rb_bd_dlp_rng-dl01_cr_AIQ_employees/aiq103/iws"
+
+
 python main.py +name=robosuite_lift_stage_1 algorithm=latent_world_model \
   experiment=exp_latent_dyn dataset=sim_robosuite_dataset \
-  dataset.dataset_dir=/fs/scratch/rb_bd_dlp_rng-dl01_cr_AIQ_employees/aiq103/iws/data/robosuite/lift \
+  dataset.dataset_dir=${FILE_DIR}/data/robosuite/lift \
   dataset.horizon=1 dataset.val_horizon=1 \
   experiment.training.batch_size=16 \
   experiment.training.precision=bf16-mixed \
@@ -60,7 +63,9 @@ python main.py +name=robosuite_lift_stage_1 algorithm=latent_world_model \
   experiment.validation.data.num_workers=16 \
   "algorithm.metrics=[]" \
   algorithm.latent_dim=512 algorithm.action_dim=4 \
-  algorithm.training_stage=1
+  algorithm.training_stage=1 \
+  hydra.run.dir=${FILE_DIR}/outputs/\${name}/\${now:%Y-%m-%d}/\${now:%H-%M-%S} \
+  "load='${FILE_DIR}/outputs/robosuite_lift_stage_1/2026-05-15/23-30-39/checkpoints/epoch=2-step=10000.ckpt'"
 
 # ---------------------------------------------------------------------------
 # Cleanup
