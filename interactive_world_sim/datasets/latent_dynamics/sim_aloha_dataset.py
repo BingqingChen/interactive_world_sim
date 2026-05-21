@@ -516,11 +516,16 @@ class SimAlohaDataset(BaseImageDataset):
                 self.replay_buffer.episode_ends[epi_idx - 1] if epi_idx > 0 else 0
             )
             epi_end = self.replay_buffer.episode_ends[epi_idx]
+            epi_len = epi_end - epi_start
+            rng = np.random.default_rng(idx)
+            offsets = rng.choice(
+                epi_len, size=self.val_horizon, replace=epi_len < self.val_horizon, replace=False
+            )
+            idxs = epi_start + np.sort(offsets)
             val_horizon = self.val_horizon
-            seq_end = min(epi_end, epi_start + val_horizon)
             sample = dict()
             for key in self.sampler.keys:
-                sample[key] = self.replay_buffer[key][epi_start:seq_end]
+                sample[key] = self.replay_buffer[key][idxs]
                 if sample[key].shape[0] < val_horizon:
                     pad_len = val_horizon - sample[key].shape[0]
                     pad_shape = (pad_len, *np.ones_like(sample[key].shape[1:]).tolist())
@@ -538,7 +543,7 @@ class SimAlohaDataset(BaseImageDataset):
                     sample[key] = sample[key][:: self.skip_frame]
                 sample[f"{key}_final"] = sample[key][-1]
                 sample["is_early_stop"] = False
-                sample["rel_stop_idx"] = val_horizon - 1
+                sample["rel_stop_idx"] = len(idxs) - 1 # note I think this value is not used
         else:
             sample = self.sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
