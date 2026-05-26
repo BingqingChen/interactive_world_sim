@@ -1,0 +1,78 @@
+#!/bin/bash
+#BSUB -J iws_b200                         # job name
+#BSUB -o jobs/logs/iws_robosuite.%J.out         # stdout log (submit from project root)
+#BSUB -e jobs/logs/iws_robosuite.%J.err         # stderr log
+#BSUB -n 16                                # CPU cores: 16 workers for data loading
+#BSUB -R span[hosts=1]                     # single host
+#BSUB -M 32768MB                           # 32 GB system RAM
+#BSUB -gpu "num=1"                         # 1× full B200 (143 GB HBM3e)
+#BSUB -W 12:00                             # 12-hour runtime limit
+#BSUB -q batch_b200                    # B200 MIG queue (no backlog)
+#BSUB -P BH-000557-01  	                   # project to charge, AIQ-103
+#BSUB -G rb_bd_dlp_rng-dl01_cr_AIQ_employees
+
+# ---------------------------------------------------------------------------
+# Environment setup
+# ---------------------------------------------------------------------------
+source /fs/applications/modules/current/init/bash
+module unload proxy4server-access
+source /fs/applications/p4s-access/1.0/ActivateP4S.sh -a
+
+# module unload cuda
+# module load cuda/12.6.0
+# module load conda/25.1.1
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate iws-5090
+export COLUMNS=200
+
+# Sanity-check: verify GPU is visible before starting training
+echo "=== GPU diagnostics ==="
+nvidia-smi || { echo "ERROR: nvidia-smi failed — GPU not available on this node"; exit 1; }
+echo "========================"
+
+# Reduce CUDA memory fragmentation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# ---------------------------------------------------------------------------
+# GPU utilization monitoring (logs every 30 s to a dedicated file)
+# ---------------------------------------------------------------------------
+nvidia-smi dmon -s upmt -d 30 > jobs/logs/gpu_util_${LSB_JOBID}.log 2>&1 &
+GPU_MON_PID=$!
+echo "GPU monitor PID: $GPU_MON_PID  →  jobs/logs/gpu_util_${LSB_JOBID}.log"
+
+# ---------------------------------------------------------------------------
+# Stage 1  (bf16-mixed + batch_size=32 for H200 utilization)
+# ---------------------------------------------------------------------------
+cd ~/interactive_world_sim
+
+FILE_DIR="/fs/scratch/rb_bd_dlp_rng-dl01_cr_AIQ_employees/aiq103/iws"
+NAME="robosuite_lift_stage_1_jacob_b200_cam1"
+
+python main.py +name=${NAME} algorithm=latent_world_model \
+  experiment=exp_latent_dyn dataset=sim_robosuite_dataset \
+  dataset.dataset_dir=${FILE_DIR}/data/robosuite/lift \
+  dataset.horizon=1 dataset.val_horizon=1 \
+  experiment.training.batch_size=16 \
+  experiment.training.precision=bf16-mixed \
+  experiment.training.data.num_workers=16 \
+  experiment.training.max_steps=2000005 \
+  experiment.training.log_every_n_steps=100 \
+  experiment.validation.limit_batch=1.0 \
+  experiment.validation.batch_size=32 \
+  experiment.validation.val_every_n_step=6000 \
+  experiment.validation.precision=bf16-mixed \
+  experiment.validation.data.num_workers=16 \
+  "algorithm.metrics=[]" \
+  algorithm.latent_dim=512 algorithm.action_dim=4 \
+  algorithm.training_stage=1 \
+  hydra.run.dir=${FILE_DIR}/outputs/\${name}/\${now:%Y-%m-%d}/\${now:%H-%M-%S} \
+  experiment.training.checkpointing.every_n_train_steps=50000 \
+  "dataset.obs_keys=[camera_0_color]" \
+  +experiment.training.checkpointing.save_top_k=-1 \
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+kill $GPU_MON_PID 2>/dev/null
+echo "=== Final GPU state ==="
+nvidia-smi
