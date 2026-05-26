@@ -1,0 +1,118 @@
+defaults:
+  - base
+  - _self_
+
+ckpt_path: outputs/pusht_mujoco/stage_2/epoch=3-step=90000.ckpt
+data_dir: data/interactive-world-sim-mujoco-data/train
+out_dir: data/wm_demo/pusht_mujoco_rollout
+
+# Algorithm config for the pusht_mujoco stage-2 checkpoint.
+# Values are concrete (no ${...} interpolations) so this file can be loaded
+# outside the full training Hydra context.
+# Structure mirrors configurations/algorithm/latent_world_model.yaml.
+algorithm:
+  debug: false
+  metrics: []
+
+  # Observation / encoder
+  obs_keys: [top_pov]
+  x_shape: [3, 128, 128]
+  num_views: 1
+  num_latent_channel: 4        # 4 * num_views
+  num_latent_downsample: 2
+  latent_resolution: 32        # 128 // 2^2
+  latent_dim: 512
+  enc_dim: 64
+  num_components: 1
+
+  # Action
+  action_dim: 4
+
+  # Training stage (2 = dynamics trained, decoder frozen)
+  training_stage: 2
+  load_ae: null
+
+  # Rollout / inference
+  n_frames: 10
+  dyn_infer_steps: 1
+  dec_infer_steps: 1           # overridden per-step at runtime; just sets the model attr
+  val_render: false
+
+  # Diffusion / noise settings
+  noise_level: log_normal
+  scheduling_matrix: autoregressive
+  clip_noise: 6.0
+  norm_scale: 6.0
+  guidance_scale: 1.0
+  uncertainty_scale: 1.0
+  prev_frame_noise_scale: 0.1
+  mask_prev_action: false
+  last_frame_loss_only: false
+  robust_latent: false
+  sampling_strategy: uniform
+  sampling_strategy_params: []
+
+  # Optimizer (not used at inference, kept for checkpoint compat)
+  weight_decay: 1e-4
+  warmup_steps: 10000
+  lr_scheduler: linear
+  optimizer_beta: [0.9, 0.999]
+  lr: 8e-5
+  delta: 221.184    # 0.00054 * num_latent_channel * latent_resolution^2
+
+  diffusion:
+    beta_schedule: sigmoid
+    objective: pred_v
+    cum_snr_decay: 0.96
+    clip_noise: 6.0
+    schedule_fn_kwargs: {}
+    timesteps: 1000
+    sampling_timesteps: 50
+    ddim_sampling_eta: 0.0
+    snr_clip: 5.0
+    model_channels: 64         # = enc_dim
+    num_latent_downsample: 2
+    num_latent_channel: 4
+    num_res_blocks: 2
+    attention_resolutions: [2, 4, 8]
+    dropout: 0.1
+    channel_mult: [1, 2, 3]
+    num_head_channels: 64
+    resblock_updown: true
+    use_scale_shift_norm: true
+    num_components: 1
+    image_size: 128
+    stabilization_level: 15
+
+  noise_scheduler:
+    _target_: interactive_world_sim.utils.cm_utils.DDPMScheduler
+    x_shape: [3, 128, 128]
+    timesteps: 1000
+    sampling_timesteps: 50
+    beta_schedule: sigmoid
+    schedule_fn_kwargs: {}
+    objective: pred_v
+    loss_weighting: fused_snr
+    snr_clip: 5.0
+    cum_snr_decay: 0.96
+    ddim_sampling_eta: 0.0
+    clip_noise: 6.0
+    stabilization_level: 15
+    dtype: ${algorithm.dtype}
+
+  dynamics:
+    _target_: interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics.CMLatentDynamics
+    action_dim: 4
+    latent_dim: 4              # = num_latent_channel
+    dim: 64
+    action_emb_dim: 512
+    resnet_block_groups: 8
+    dim_mults: [1, 2]
+    attn_dim_head: 128
+    attn_heads: 4
+    use_linear_attn: true
+    use_init_temporal_attn: true
+    init_kernel_size: 5
+    is_causal: true
+    time_emb_type: rotary
+    dtype: ${algorithm.dtype}
