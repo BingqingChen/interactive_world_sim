@@ -1,0 +1,15 @@
+# Base visualization settings shared across all checkpoints.
+# Checkpoint-specific configs (e.g. pusht_mujoco.yaml) inherit from this.
+
+n_episodes: 3
+t_pred: 300
+dec_infer_steps: [1]
+fps: 10
+seed: 42
+device: cuda
+
+# Inference dtype. Matches the bf16-mixed precision used during training
+# (see jobs/train_stage*.bsub) so SDPA can dispatch the flash / mem-efficient
+# kernels for the dynamics attention layers.
+algorithm:
+  dtype: ${torch:bfloat16}
