@@ -6,7 +6,7 @@
 #BSUB -R span[hosts=1]                     # single host
 #BSUB -M 32768MB                           # 16 GB system RAM
 #BSUB -gpu "num=1"                      # 1× full H200 (143 GB HBM3e)
-#BSUB -W 18:00                             # 12-hour runtime limit
+#BSUB -W 20:00                             # 12-hour runtime limit
 #BSUB -q batch_b200                    # H200 MIG queue (no backlog)
 #BSUB -P BH-000557-01  	                   # project to charge, AIQ-103
 #BSUB -G rb_bd_dlp_rng-dl01_cr_AIQ_employees
@@ -70,7 +70,8 @@ python main.py +name=robosuite_lift_stage_2_jacob_b200 algorithm=latent_world_mo
   experiment.training.precision=bf16-mixed \
   experiment.validation.precision=bf16-mixed \
   "dataset.obs_keys=[camera_0_color]" \
-  +experiment.training.checkpointing.save_top_k=-1
+  +experiment.training.checkpointing.save_top_k=-1 \
+  "load='${FILE_DIR}/outputs/robosuite_lift_stage_2_jacob_b200/2026-05-26/23-24-26/checkpoints/epoch=40-step=680000.ckpt'"
 
   ## Resume from previous checkpoint 
   #"load='${FILE_DIR}/outputs/robosuite_lift_stage_2/2026-04-21/22-09-12/checkpoints/epoch=2-step=60000.ckpt'"
