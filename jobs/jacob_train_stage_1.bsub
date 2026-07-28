@@ -1,10 +1,10 @@
 #!/bin/bash
 #BSUB -J iws_b200                         # job name
-#BSUB -o jobs/logs/iws_robosuite.%J.out         # stdout log (submit from project root)
-#BSUB -e jobs/logs/iws_robosuite.%J.err         # stderr log
+#BSUB -o jobs/logs/iws_pusht_rotate_t.%J.out    # stdout log (submit from project root)
+#BSUB -e jobs/logs/iws_pusht_rotate_t.%J.err    # stderr log
 #BSUB -n 16                                # CPU cores: 16 workers for data loading
 #BSUB -R span[hosts=1]                     # single host
-#BSUB -M 32768MB                           # 32 GB system RAM
+#BSUB -M 98304MB                           # 96 GB RAM: combined mujoco+rotate-t cache is held in memory (rebuilding it from scratch needs far more — see data setup note below)
 #BSUB -gpu "num=1"                         # 1× full B200 (143 GB HBM3e)
 #BSUB -W 12:00                             # 12-hour runtime limit
 #BSUB -q batch_b200                    # B200 MIG queue (no backlog)
@@ -46,11 +46,13 @@ echo "GPU monitor PID: $GPU_MON_PID  →  jobs/logs/gpu_util_${LSB_JOBID}.log"
 cd ~/interactive_world_sim
 
 FILE_DIR="/fs/scratch/rb_bd_dlp_rng-dl01_cr_AIQ_employees/aiq103/iws"
-NAME="robosuite_lift_stage_1_jacob_b200_cam1"
+NAME="pusht_rotate_t_stage_1_jacob_b200"
+
+MUJOCO_DATA=${FILE_DIR}/data/interactive-world-sim-mujoco-data
 
 python main.py +name=${NAME} algorithm=latent_world_model \
-  experiment=exp_latent_dyn dataset=sim_robosuite_dataset \
-  dataset.dataset_dir=${FILE_DIR}/data/robosuite/lift \
+  experiment=exp_latent_dyn dataset=sim_aloha_dataset \
+  dataset.dataset_dir=${MUJOCO_DATA} \
   dataset.horizon=1 dataset.val_horizon=1 \
   experiment.training.batch_size=16 \
   experiment.training.precision=bf16-mixed \
@@ -67,7 +69,7 @@ python main.py +name=${NAME} algorithm=latent_world_model \
   algorithm.training_stage=1 \
   hydra.run.dir=${FILE_DIR}/outputs/\${name}/\${now:%Y-%m-%d}/\${now:%H-%M-%S} \
   experiment.training.checkpointing.every_n_train_steps=50000 \
-  "dataset.obs_keys=[camera_0_color]" \
+  "dataset.obs_keys=[top_pov]" \
   +experiment.training.checkpointing.save_top_k=-1 \
 
 # ---------------------------------------------------------------------------
