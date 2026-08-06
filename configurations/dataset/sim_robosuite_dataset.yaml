@@ -15,7 +15,7 @@ use_cache: true
 resolution: 128
 obs_keys: [camera_0_color, camera_1_color]
 low_dim_keys: []
-action_mode: single_grasp
+action_mode: single_grasp_cmd  # action = [ee_xyz(3), gripper open/close command(1)]
 goal_sample: intermediate
 shape_meta:
   action:

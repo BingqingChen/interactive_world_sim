@@ -105,6 +105,13 @@ def _convert_real_to_dp_replay(
                 ee_xyz = ee_pos[:, 0, :3, 3]  # (T, 3)
                 gripper = joint_pos[:, -1:]  # (T, 1)
                 action_data = np.concatenate([ee_xyz, gripper], axis=1)  # (T, 4)
+            elif ctrl_mode == "single_grasp_cmd":
+                # Like single_grasp but the 4th dim is the actual gripper open/close COMMAND
+                # (stored at obs/gripper), not joint_pos[:,-1] (the wrist joint, which carries no
+                # grasp signal). Required for tasks where grasping matters, e.g. robosuite Lift.
+                ee_xyz = ee_pos[:, 0, :3, 3]  # (T, 3)
+                gripper = file["obs"]["gripper"][()]  # (T, 1) open/close command in [-1, 1]
+                action_data = np.concatenate([ee_xyz, gripper], axis=1)  # (T, 4)
             else:
                 raise NotImplementedError(
                     f"ctrl_mode '{ctrl_mode}' is not implemented for SimAlohaDataset"
@@ -242,9 +249,100 @@ def _convert_real_to_dp_replay(
     return replay_buffer
 
 
+def _merge_replay_buffers(buffers: list) -> ReplayBuffer:
+    """Concatenate several ReplayBuffers into one MemoryStore-backed buffer.
+
+    Frame-chunked arrays (chunks[0] == 1, i.e. the compressed image streams) are
+    merged by copying raw compressed chunks with renumbered keys — no decode /
+    re-encode. Everything else (lowdim, single-chunk) is concatenated in memory.
+    """
+
+    def chunk_key(arr: zarr.Array, coords: tuple) -> str:
+        try:
+            return arr._chunk_key(coords)
+        except AttributeError:
+            sep = getattr(arr, "_dimension_separator", None) or "."
+            return arr.path + "/" + sep.join(map(str, coords))
+
+    out_store = zarr.MemoryStore()
+    out_root = zarr.group(out_store)
+    out_data = out_root.require_group("data", overwrite=True)
+    out_meta = out_root.require_group("meta", overwrite=True)
+
+    episode_ends = []
+    offset = 0
+    for buffer in buffers:
+        ends = buffer.episode_ends[:]
+        episode_ends.append(ends + offset)
+        offset += int(ends[-1])
+    episode_ends = np.concatenate(episode_ends)
+    out_meta.array(
+        "episode_ends", episode_ends, dtype=np.int64, compressor=None, overwrite=True
+    )
+
+    keys = sorted(buffers[0].keys())
+    for buffer in buffers[1:]:
+        assert sorted(buffer.keys()) == keys, (
+            f"replay buffers have mismatched keys: {sorted(buffer.keys())} vs {keys}"
+        )
+    n_total = int(episode_ends[-1])
+    for key in keys:
+        arrs = [buffer.data[key] for buffer in buffers]
+        first = arrs[0]
+        for arr in arrs[1:]:
+            assert arr.shape[1:] == first.shape[1:] and arr.dtype == first.dtype, key
+        if first.chunks[0] == 1:
+            for arr in arrs[1:]:
+                assert arr.chunks == first.chunks, key
+                assert (arr.compressor is None) == (first.compressor is None) and (
+                    arr.compressor is None
+                    or arr.compressor.get_config() == first.compressor.get_config()
+                ), f"compressor mismatch for '{key}' — caches built with different codecs"
+            out_arr = out_data.require_dataset(
+                name=key,
+                shape=(n_total, *first.shape[1:]),
+                chunks=first.chunks,
+                compressor=first.compressor,
+                dtype=first.dtype,
+            )
+            tail = (0,) * (first.ndim - 1)
+            t0 = 0
+            for arr in arrs:
+                src_store = arr.store
+                for i in range(arr.shape[0]):
+                    src_key = chunk_key(arr, (i, *tail))
+                    if src_key in src_store:  # fill-value chunks may be absent
+                        out_store[chunk_key(out_arr, (t0 + i, *tail))] = src_store[
+                            src_key
+                        ]
+                t0 += arr.shape[0]
+        else:
+            data = np.concatenate([arr[:] for arr in arrs], axis=0)
+            _ = out_data.array(
+                name=key,
+                data=data,
+                shape=data.shape,
+                chunks=data.shape,
+                compressor=None,
+                dtype=data.dtype,
+            )
+    return ReplayBuffer(out_root)
+
+
 def load_replay_buffer(
     dataset_dir: str, use_cache: bool, shape_meta: dict, ctrl_mode: str = "bimanual_push",
 ) -> ReplayBuffer:
+    if not isinstance(dataset_dir, str):
+        dirs = [str(d) for d in dataset_dir]
+        if len(dirs) > 1:
+            print(f"Merging {len(dirs)} replay buffers: {dirs}")
+            return _merge_replay_buffers(
+                [
+                    load_replay_buffer(d, use_cache, shape_meta, ctrl_mode=ctrl_mode)
+                    for d in dirs
+                ]
+            )
+        dataset_dir = dirs[0]
     replay_buffer = None
     if use_cache:
         cache_info_str = ""
@@ -327,7 +425,12 @@ class SimAlohaDataset(BaseImageDataset):
 
         self.action_mode = cfg.action_mode if "action_mode" in cfg else "bimanual_push"
 
-        train_dir = os.path.join(dataset_dir, "train")
+        # dataset_dir may be a single root or a list of roots, each containing
+        # train/ and val/ subdirectories; multiple roots are merged.
+        if isinstance(dataset_dir, str):
+            train_dir = os.path.join(dataset_dir, "train")
+        else:
+            train_dir = [os.path.join(str(d), "train") for d in dataset_dir]
         self.replay_buffer = load_replay_buffer(
             train_dir, use_cache, shape_meta, ctrl_mode=self.action_mode
         )
@@ -420,7 +523,10 @@ class SimAlohaDataset(BaseImageDataset):
         """Return a validation dataset."""
         val_set = copy.copy(self)
         val_set.is_val = True
-        val_dir = os.path.join(self.dataset_dir, "val")
+        if isinstance(self.dataset_dir, str):
+            val_dir = os.path.join(self.dataset_dir, "val")
+        else:
+            val_dir = [os.path.join(str(d), "val") for d in self.dataset_dir]
         shape_meta = self.shape_meta
         use_cache = self.use_cache
         val_set.replay_buffer = load_replay_buffer(

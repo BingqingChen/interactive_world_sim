@@ -12,11 +12,12 @@ Usage (cluster, after downloading the rotate-t data):
 Cache handling: an existing <dst>/<split>/cache.zarr.zip is STALE after new
 episodes are added (the loader trusts it blindly and would silently ignore the
 new data), so by default it is deleted and the next training run rebuilds it.
-NOTE: a full rebuild of the combined mujoco+rotate-t cache holds every raw
-frame in RAM twice (~270 GB peak) — run that first job on a high-memory node,
-or pass --merge_cache to update the existing cache in place instead: the new
-episodes are converted and appended to the old cache via compressed-chunk copy
-(peak RAM ~ raw size of the NEW data only, ~40 GB here).
+NOTE: a full in-training rebuild of the combined mujoco+rotate-t cache holds
+every raw frame in RAM twice (~270 GB peak). If dst already has a cache, pass
+--merge_cache to update it in place (compressed-chunk copy; peak RAM ~ raw size
+of the NEW data only, ~40 GB here). If dst has NO cache (e.g. a fresh download —
+the mujoco HF repo ships none), build it afterwards with
+scripts/data_collection/build_cache.py, which needs only ~2x one batch of RAM.
 """
 import argparse
 import glob
