@@ -14,6 +14,8 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
 from yixuan_utilities.draw_utils import center_crop
 from yixuan_utilities.hdf5_utils import load_dict_from_hdf5
@@ -104,6 +106,30 @@ def load_model(algo_name: str, ckpt_path: str) -> pl.LightningModule:
     return algo
 
 
+def load_sim_model(config_name: str, ckpt_path: str) -> pl.LightningModule:
+    # Sim checkpoints have no .hydra sibling; their algorithm config lives in
+    # configurations/visualization/<config_name>.yaml (see eval_metric_correlation).
+    GlobalHydra.instance().clear()
+    viz_config_dir = repo_root / "configurations" / "visualization"
+    with initialize_config_dir(
+        config_dir=str(viz_config_dir.resolve()), version_base=None
+    ):
+        cfg = compose(config_name=config_name)
+    dtype = torch.float32 if "dtype" not in cfg.algorithm else cfg.algorithm.dtype
+    algo = LatentWorldModel.load_from_checkpoint(
+        ckpt_path,
+        cfg=cfg.algorithm,
+        map_location="cuda:0",
+        dtype=dtype,
+        strict=False,
+        weights_only=False,
+    )
+    algo.dynamics = algo.dynamics.to(dtype)
+    algo.eval()
+    algo.dynamics.eval()
+    return algo.to("cuda:0")
+
+
 act_horizon = 1
 algo_name = "latent_world_model"
 t = 0
@@ -115,13 +141,14 @@ def load_task_config(
 ) -> tuple[int, LatentWorldModel, Any, torch.Tensor, np.ndarray]:
     data_dir = repo_root / "data" / "mini"
 
+    is_sim = False
     if scene == "pusht":
+        # MuJoCo sim PushT world model (top-down camera, bimanual EE-XY actions).
+        is_sim = True
         resolution = 128
-        ckpt_path = str(
-            repo_root / "outputs" / "pusht_cam1" / "checkpoints" / "best.ckpt"
-        )
-        dataset_path = str(data_dir / "pusht" / "val" / "episode_0.hdf5")
-        obs_keys = ["camera_1_color"]
+        ckpt_path = str(repo_root / "ckpts" / "push_t" / "epoch=3-step=90000.ckpt")
+        dataset_path = str(repo_root / "datasets" / "val" / "episode_0.hdf5")
+        obs_keys = ["top_pov"]
     elif scene == "bimanual_rope_cam_0":
         resolution = 128
         ckpt_path = str(
@@ -146,7 +173,12 @@ def load_task_config(
     else:
         raise ValueError(f"Unknown scene: '{scene}'")
 
-    model: LatentWorldModel = load_model(algo_name=algo_name, ckpt_path=ckpt_path)
+    if is_sim:
+        model: LatentWorldModel = load_sim_model(
+            config_name="pusht_mujoco", ckpt_path=ckpt_path
+        )
+    else:
+        model = load_model(algo_name=algo_name, ckpt_path=ckpt_path)
     normalizer = model.normalizer
     load_epi_data, _ = load_dict_from_hdf5(dataset_path)
 
@@ -166,6 +198,12 @@ def load_task_config(
     img_tensor = torch.cat(img_tensor_list, dim=1)
     with torch.no_grad():
         curr_latent_tensor = model.encoder_forward(img_tensor)[None]
+    curr_latent_tensor = curr_latent_tensor.to(model.dtype)
+
+    if is_sim:
+        # Sim episodes store the commanded bimanual EE-XY action directly.
+        curr_action = load_epi_data["action"][t][None]  # (1, 4)
+        return resolution, model, normalizer, curr_latent_tensor, curr_action
 
     # Build initial action from joint positions
     joint_pos = load_epi_data["obs"]["joint_pos"][t]
@@ -260,12 +298,13 @@ def parse_action(msg: Dict[str, Any], scene: str) -> np.ndarray:
 
 def kybd_action_to_rob_action(delta_action: np.ndarray, scene: str) -> np.ndarray:
     if scene == "pusht":
+        # Sim top-down view: kybd axes map straight onto bimanual EE-XY.
         delta_action_rob = np.array(
             [
-                -delta_action[3],
-                delta_action[2],
-                -delta_action[1],
                 delta_action[0],
+                delta_action[1],
+                delta_action[2],
+                delta_action[3],
             ]
         )
     elif scene in ["bimanual_sweep_cam_0", "single_grasp_cam_0"]:
@@ -379,7 +418,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     "pusht",
                     "pusht_cam_0",
                 ]:
-                    delta_action = delta_action / (50.0 * action_range_scale)
+                    delta_action = delta_action / (100.0 * action_range_scale)
                 elif scene in ["bimanual_rope_cam_0", "bimanual_rope_cam_1"]:
                     delta_action = delta_action / (30.0 * action_range_scale)
                 elif scene in ["bimanual_sweep_cam_0", "bimanual_sweep_cam_1"]:
@@ -405,7 +444,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 curr_action = torch.clamp(curr_action, -1.0, 1.0)
 
                 action_hist.append(curr_action.clone())
-                action = torch.cat(action_hist, dim=0)[-(hist_context + 1) :].float()
+                action = torch.cat(action_hist, dim=0)[-(hist_context + 1) :].to(
+                    model.dtype
+                )
 
                 latent_pred = model.dynamics_forward(curr_latent_tensor, action[None])
                 curr_latent_tensor = torch.cat(

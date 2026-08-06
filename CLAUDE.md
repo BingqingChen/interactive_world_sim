@@ -70,8 +70,12 @@ python scripts/inference/teleoperate_keyboard.py \
 
 **Local demo server:**
 ```bash
-bash deploy/start_demo.sh
+bash deploy/start_demo.sh                # world model only, serves its own UI (port 8000)
+bash deploy/start_sim_demo.sh [PORT]     # lockstep sim-vs-WM BACKEND, API only (port 8001)
 ```
+`start_sim_demo.sh` serves no HTML — the UI is the `../iws-demo-frontend` repo, run there
+with `./serve.py`. `deploy/server.py` / `start_demo.sh` is the older self-contained demo
+and is unaffected.
 
 **Data collection (real robot):**
 ```bash
@@ -156,3 +160,23 @@ Start with `bimanual_push` action mode (EE XY, action_dim=4) for maximum model c
 ### Deploy (Browser Demo)
 
 `deploy/server.py` is a FastAPI + WebSocket server that runs inference from a pre-loaded `LatentWorldModel` and streams rendered frames to the browser. Start with `bash deploy/start_demo.sh`, then connect from the project page or `localhost`.
+
+`deploy/sim_demo_server.py` is a second, self-contained demo that drives the **MuJoCo PushT sim and the world model in lockstep** on the same keyboard-commanded action stream, and renders ground truth / prediction / difference side by side with live PSNR and T-rotation drift (`deploy/sim_demo_metrics.py`; the UI lives in `../iws-demo-frontend`). Start with `bash deploy/start_sim_demo.sh` (API on port 8001 — over SSH, VS Code forwards the port automatically) and run the UI from the frontend repo. Notes:
+
+- Both sides step **only while a key is held** (WASD = left arm, IJKL = right arm); release everything and the scene freezes. `R` resets, `Space` force-freezes.
+- The world model is pure open-loop from the reset frame; **Re-sync WM** re-encodes the current sim frame into its latent history.
+- Init modes: `fixed` (default), `random`, and `wm_train`. Only `wm_train` matches how the checkpoint's training data was collected (stock random-theta pose sampler + 100-step random arm init); the other two spawn the T upright and are measurably less faithful.
+- On reset the sim is stepped `IWS_DEMO_SETTLE_STEPS` (100) times so the T falls from its 0.07 spawn height and comes to rest before anything is observed. In `fixed` mode the grippers are then driven outward by `IWS_DEMO_ARM_SPREAD` (0.06 m). That is not cosmetic: at the env's home pose the block rests at z=+0.017, propped on the grippers rather than on the table; once they move clear it settles to z=-0.001. The reachable spread is bounded by the workspace clip in `trajectory_to_joint_actions`, so values much beyond 0.06 have no further effect.
+- Configured through `IWS_DEMO_*` env vars (uvicorn imports the app, so there is no argv). Defaults: `IWS_DEMO_ACTION_LAG=1` and `IWS_DEMO_DEC_STEPS=2`, both chosen by measurement — `dec_infer_steps=2` lifts the decoder's own reconstruction from ~27 dB to ~45 dB PSNR for +3 ms/tick, so the reported PSNR reflects dynamics error rather than decoder blur.
+- `python deploy/sim_demo_server.py --ticks 100` exercises the whole engine headlessly (no browser), printing per-tick PSNR, both T angles and the timing breakdown. Steady state is ~45 ms/tick against the 100 ms budget.
+
+**The browser UI lives in a separate repo** — `../iws-demo-frontend`. This repo is the backend: world model inference, the simulator, reset distributions. It serves `/ws`, `/api/scaling`, `/rollouts/...` and `/figures/{name}` with permissive CORS, and no HTML. Run the UI with `./serve.py` in the frontend repo; for the live demo, tunnel the backend with `ssh -N -L 8001:localhost:8001 <user>@<host>`. The split exists so rollout videos load from local disk on the user's own machine instead of trickling through the tunnel (measured at ~34 KB/s, which made a 10-video grid take ~50 s).
+
+The frontend's scaling page plots the real-vs-imagined scaling results interactively and plays the rollouts behind each point:
+
+- `scripts/extract_scaling_metrics.py` parses `outputs/random_init_evals/scale_eval_logs/` (45 runs = 15 conditions x 3 seeds, the full stdout of every `eval_dp_rotate_t.py` run behind the study) into `scaling_metrics.json`. It recovers **both** plotted metrics — success rate (`outputs/scaling_plot_final.png`) and mean T rotation (`outputs/scaling_plot_rotation.png`) — so the page shows the published n=50 numbers, not a re-run approximation. The eval reports CW rotation as negative; the extractor flips the sign to match the figure's axis.
+- `scripts/collect_scaling_rollouts.py` records rollout videos per condition using the published protocol (seed 7000, random init), so episode *k* is the same initial state for every policy and matches episode *k* of the published eval. Videos are encoded at the true 10 Hz control rate, which is what lets the page's speed buttons be exact multiples of real time. The manifest is written incrementally, so the page is usable while the sweep runs.
+- Keep the two straight: the **charts** are the published n=50 numbers; the **videos** are a separate small sample from one training seed. At `r=10, +0 imagined` (4% success) a 10-episode sample will usually show zero successes — that is expected, not a contradiction.
+- `/api/scaling` merges both sources and is re-read per request; `/rollouts/...` serves the mp4s; `/figures/{success_rate,rotation_deg}` serves the original PNGs. The frontend prefers its own synced copies and falls back to these endpoints when it has not synced yet.
+- `scripts/collect_wm_gallery.py` renders the world-model half of the page: 24 paired world-model-vs-simulator clips from `outputs/wm_quality/rollout_frames.npz` (same commanded actions, imagination left, physics right, per-episode PSNR/angle), and sampled episodes from the pooled imagined training set. Imagined samples are indexed by *pooled* index — randA(375)+randB(375)+randC(50) concatenated, exactly as `build_scaling_zarrs.py` slices it, where a `+N` dose takes pooled `0:N` — so each clip is tagged with the doses containing it. Pairs with `outputs/wm_video_metrics_plot.png`, whose per-episode data is in `outputs/wm_quality/video_metrics.npz`.
+- `scripts/shrink_rollout_videos.py` re-encodes rollouts at the frames' native 128x128 and 5 fps (every 2nd control step, real-time duration preserved). Idempotent, so it is safe to re-run after a fresh collection sweep. Videos are ~157 KB each; without it they are ~890 KB.

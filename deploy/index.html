@@ -136,10 +136,10 @@
   <div id="task-panel">
     <label for="taskSelect">TASK</label>
     <select id="taskSelect">
-      <option value="pusht" selected>PushT</option>
-      <option value="bimanual_rope_cam_0">Bimanual Rope Routing</option>
-      <option value="single_grasp_cam_0">Mug Grasping</option>
-      <option value="bimanual_sweep_cam_0">Bimanual Sweeping</option>
+      <option value="pusht" selected>PushT (MuJoCo)</option>
+      <option value="bimanual_rope_cam_0" disabled>Bimanual Rope Routing (no ckpt)</option>
+      <option value="single_grasp_cam_0" disabled>Mug Grasping (no ckpt)</option>
+      <option value="bimanual_sweep_cam_0" disabled>Bimanual Sweeping (no ckpt)</option>
     </select>
   </div>
 
@@ -215,8 +215,9 @@
 
   const taskSelect = document.getElementById("taskSelect");
 
-  // Adjust this to your backend URL (UNCHANGED)
-  const ws = new WebSocket('ws://localhost:8000/ws');
+  // Connect back to whichever host served this page (works via SSH port
+  // forwarding and direct LAN access alike).
+  const ws = new WebSocket(`ws://${location.host}/ws`);
 
   <!-- const ws = new WebSocket('wss://wangyixuan0720--diffusion-forcing-demo-web.modal.run/ws'); -->
 
