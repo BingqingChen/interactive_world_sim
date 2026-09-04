@@ -91,6 +91,16 @@ bsub < jobs/train_stage1.bsub
 bsub < jobs/train_stage2.bsub
 ```
 
+## Porting to another machine
+
+`../diffusion_policy/docs/working_on_another_machine.md`. In short: ~77 tracked files
+across the two repos hard-code `/home/jacobhb`, several script constants point at
+specific checkpoints, and a residual `.pt` stores the absolute path of the frozen base
+it loads (so that one is not greppable). Easiest route is to check both repos out at
+the same absolute path. None of the datasets, checkpoints or `outputs/` are in git; the
+science itself is ~65 MB of eval JSONs and videos, everything else is regenerable or
+large.
+
 ## Data filing (project convention)
 
 Authoritative rules live in the companion repo: `../diffusion_policy/docs/data_filing_rules.md`
