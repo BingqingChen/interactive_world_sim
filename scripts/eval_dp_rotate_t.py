@@ -173,6 +173,10 @@ def main():
     ap.add_argument("--no_settle", action="store_true",
                     help="Skip the random arm settle (fixed home arm start); use with a fixed "
                          "T position (--x_min==--x_max, --y_min==--y_max) for the easy fixed task.")
+    ap.add_argument("--feasible_mask", default=None,
+                    help="Path to a feasible_mask json (e.g. datasets/feasible_mask_v1.json): "
+                         "resets are additionally rejection-sampled until the post-settle T "
+                         "position lands in a feasible cell (the feasible-region protocol).")
     ap.add_argument("--metrics_json", default=None,
                     help="If set, write per-episode metrics (deg, steps, success, gripper-T "
                          "contacts) plus the summary to this JSON file.")
@@ -193,6 +197,31 @@ def main():
         Path(args.video_dir).mkdir(parents=True, exist_ok=True)
 
     contact_sets = build_contact_sets(env)
+    fmask = None
+    if args.feasible_mask:
+        import json as _json
+        _m = _json.loads(Path(args.feasible_mask).read_text())
+        fmask = (np.array(_m["mask"], bool), np.array(_m["grid_cm"]["edges"]))
+        print(f"feasible-region protocol: {fmask[0].sum()}/"
+              f"{fmask[0].size} cells ({args.feasible_mask})")
+
+    def in_feasible_region():
+        # Out-of-grid inits are REJECTED, not clamped into an edge cell: the
+        # settle phase can push the T past the +-8cm sampling bound (observed up
+        # to x=+12.2cm), which is outside the entire training distribution.
+        # Clamping silently admitted those (16/400 episodes, 17% success vs 78%
+        # in-box) and inflated the apparent difficulty of the edge cells.
+        if fmask is None:
+            return True
+        s = env._env.task.get_observation(env._env.physics)["env_state"]
+        e = fmask[1]
+        x_cm, y_cm = s[0] * 100, s[1] * 100
+        if not (e[0] <= x_cm < e[-1] and e[0] <= y_cm < e[-1]):
+            return False
+        i = int(np.digitize(x_cm, e) - 1)
+        j = int(np.digitize(y_cm, e) - 1)
+        return bool(fmask[0][i, j])
+
     deltas, successes, step_counts, episode_records = [], [], [], []
     trial = 0
     for ep in range(args.n_episodes):
@@ -200,20 +229,41 @@ def main():
         # reset -> settle (varied arm start, like training) -> require upright start.
         # With --no_settle the arm stays at fixed home and the T is already upright, so a
         # single reset suffices (no retry loop needed).
+        attempts = 0
         while True:
             env.reset(seed=args.seed + trial)
             trial += 1
+            attempts += 1
+            if attempts > 200:
+                # Guard: a restrictive mask (e.g. a single-cell mask used for
+                # per-cell characterization) combined with settle drift could
+                # otherwise spin forever.
+                raise RuntimeError(
+                    f"episode {ep}: no init satisfied the mask in 200 resets")
             C.stabilize_t(env)  # let the T fall/settle before observing anything
             o = env._env.task.get_observation(env._env.physics)
             lb = pose_convert(o["left_base"][None], PoseType.POS_QUAT, PoseType.MAT)[0]
             rb = pose_convert(o["right_base"][None], PoseType.POS_QUAT, PoseType.MAT)[0]
             world_t_bases = np.stack([lb, rb])
             if args.no_settle:
-                break
+                if in_feasible_region():
+                    break
+                continue
             C.settle_arms(env, world_t_bases, kin_helper, np.zeros(6),
                           DT, K_P, K_V, ACC_LIM, VEL_LIM)
-            if abs(C.t_angle(env)) <= C.UPRIGHT_TOL:
-                break  # T still upright after settle
+            if abs(C.t_angle(env)) <= C.UPRIGHT_TOL and in_feasible_region():
+                break  # T still upright after settle, init inside the feasible region
+
+        # Record the accepted init so results can be decomposed by region afterwards.
+        # Which cells still fail is the diagnostic that matters, and it is not
+        # recoverable from the summary alone.
+        _s = env._env.task.get_observation(env._env.physics)["env_state"]
+        init_xy_cm = [round(float(_s[0]) * 100, 2), round(float(_s[1]) * 100, 2)]
+        init_cell = None
+        if fmask is not None:
+            _e = fmask[1]
+            init_cell = [int(np.digitize(init_xy_cm[0], _e) - 1),
+                         int(np.digitize(init_xy_cm[1], _e) - 1)]
 
         record = ep < args.n_videos
         t0 = time.time()
@@ -227,7 +277,8 @@ def main():
         step_counts.append(steps)
         episode_records.append({
             "episode": ep, "success": bool(ok), "rotation_deg": float(np.degrees(delta)),
-            "steps": int(steps), **{k: int(v) for k, v in contacts.items()},
+            "steps": int(steps), "init_xy_cm": init_xy_cm, "init_cell": init_cell,
+            **{k: int(v) for k, v in contacts.items()},
         })
         print(f"  ep {ep:2d}: rotated {np.degrees(delta):+6.1f} deg  steps={steps:3d}  "
               f"contacts={contacts['contact_events']:2d} "

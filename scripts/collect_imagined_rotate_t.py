@@ -36,6 +36,7 @@ import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -128,7 +129,7 @@ def find_terminal_frame(ep_imgs, templates, tc, stride=4):
     return None
 
 
-def get_initial_states(env, kin, bsz, seed0, random_init, trial=0):
+def get_initial_states(env, kin, bsz, seed0, random_init, trial=0, region=None):
     """Per-episode real env resets -> batched initial frames + start EE-xy.
 
     random_init=False: T fixed at (0,0) upright, arms at home (no settle).
@@ -152,6 +153,8 @@ def get_initial_states(env, kin, bsz, seed0, random_init, trial=0):
                               E.DT, E.K_P, E.K_V, E.ACC_LIM, E.VEL_LIM)
                 if abs(C.t_angle(env)) > C.UPRIGHT_TOL:
                     continue  # settle bumped the T off upright -> fresh reset
+                if region is not None and not region(env):
+                    continue  # settle drifted the T outside the feasible region
             image, agent_pos, frame_uint8 = E.get_obs(env, kin, world_t_bases)
             imgs.append(image)
             homes.append(agent_pos)
@@ -162,10 +165,18 @@ def get_initial_states(env, kin, bsz, seed0, random_init, trial=0):
 
 
 @torch.no_grad()
-def imagine_batch(wm, policy, img0, home_xy, frame0_u8, bsz, ep_len, n_act, device):
+def imagine_batch(wm, policy, img0, home_xy, frame0_u8, bsz, ep_len, n_act, device,
+                  labeler=None):
     """Roll `bsz` episodes of `ep_len` frames inside the world model, each from its
     OWN initial state (img0 (B,3,128,128), home_xy (B,4), frame0_u8 (B,128,128,3)).
-    Returns (imgs uint8 (B,ep_len,128,128,3), states (B,ep_len,4), actions (B,ep_len,4))."""
+    Returns (imgs uint8 (B,ep_len,128,128,3), states (B,ep_len,4), actions (B,ep_len,4)).
+
+    `labeler`: optional second policy. When given, `policy` still drives the
+    rollout (so the visited state distribution is the rollout policy's), but the
+    STORED actions are the labeler's at the same hallucinated observation. That
+    is the DAgger setting: states ~ student, labels ~ expert, both evaluated in
+    the world model. With labeler=None the stored actions are the rollout
+    policy's own (the standard off-policy imagined-data recipe)."""
     assert ep_len % n_act == 0, "ep_len must be a multiple of n_action_steps"
     n_plans = ep_len // n_act
 
@@ -175,7 +186,8 @@ def imagine_batch(wm, policy, img0, home_xy, frame0_u8, bsz, ep_len, n_act, devi
     states = np.empty((bsz, ep_len, 4), dtype=np.float32)
     states[:, 0] = home_xy
     # action slot k = target executed at frame k; +n_act slack for the trailing pad.
-    actions = torch.zeros(bsz, ep_len + n_act, 4, dtype=torch.float32)
+    actions = torch.zeros(bsz, ep_len + n_act, 4, dtype=torch.float32)   # stored labels
+    exec_actions = torch.zeros(bsz, ep_len + n_act, 4, dtype=torch.float32)  # what drove the WM
 
     # Encode each episode's own initial frame.
     f0 = torch.from_numpy(img0).to(device)  # (B,3,128,128) [0,1]
@@ -197,16 +209,21 @@ def imagine_batch(wm, policy, img0, home_xy, frame0_u8, bsz, ep_len, n_act, devi
             "agent_pos": torch.stack([prev_state, curr_state], dim=1),  # (B,2,4)
         }
         plan = policy.predict_action(obs_dict)["action"]  # (B,n_act,4) raw EE-xy
-        actions[:, t : t + n_act] = plan.cpu().float()
-        actions[:, t + n_act] = plan[:, -1].cpu().float()  # trailing pad (overwritten next plan)
+        # DAgger: the rollout follows `plan`, but we record what the labeler
+        # would have done at this same hallucinated observation.
+        label = plan if labeler is None else labeler.predict_action(obs_dict)["action"]
+        actions[:, t : t + n_act] = label.cpu().float()
+        actions[:, t + n_act] = label[:, -1].cpu().float()  # trailing pad
 
         # --- WM: generate the next n_act latents ---
         # z_hist always holds frames lo..t (last <=10), so actions must cover
         # slots lo..t+n_act to stay frame-aligned (dynamics pairs action[k] with
         # frame k; the slot at t+n_act is the pad written above).
+        exec_actions[:, t : t + n_act] = plan.cpu().float()
+        exec_actions[:, t + n_act] = plan[:, -1].cpu().float()
         lo = max(0, t - 9)
         assert z_hist.shape[1] == t - lo + 1, (z_hist.shape, t, lo)
-        act_win = actions[:, lo : t + n_act + 1].to(device)
+        act_win = exec_actions[:, lo : t + n_act + 1].to(device)
         act_win = wm.normalizer["action"].normalize(act_win).to(wm.dtype)
         z_new = wm.dynamics_forward(z_hist, act_win)  # (B,n_act,C,H,W)
         z_hist = torch.cat([z_hist, z_new], dim=1)[:, -10:]
@@ -226,19 +243,22 @@ def imagine_batch(wm, policy, img0, home_xy, frame0_u8, bsz, ep_len, n_act, devi
             imgs[:, k] = (
                 (dec[:, j] * 255).round().byte().permute(0, 2, 3, 1).cpu().numpy()
             )
-            states[:, k] = actions[:, k - 1].numpy()  # EE estimate = previous target
+            states[:, k] = exec_actions[:, k - 1].numpy()  # EE estimate = previous EXECUTED target
         prev_img = dec[:, -2] if n_act >= 2 else curr_img
         curr_img = dec[:, -1]
         t += n_act
-        prev_state = actions[:, t - 2].to(device)
-        curr_state = actions[:, t - 1].to(device)
+        prev_state = exec_actions[:, t - 2].to(device)
+        curr_state = exec_actions[:, t - 1].to(device)
 
     return imgs, states, actions[:, :ep_len].numpy()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dp_ckpt", required=True)
+    ap.add_argument("--dp_ckpt", default=None)
+    ap.add_argument("--residual", default=None,
+                    help="PPO residual .pt -- drive the world model with "
+                         "`frozen DP + residual head` instead of a plain DP checkpoint")
     ap.add_argument("--wm_ckpt", default="ckpts/push_t/epoch=3-step=90000.ckpt")
     ap.add_argument("--wm_config", default="pusht_mujoco")
     ap.add_argument("--n_episodes", type=int, default=200)
@@ -249,6 +269,12 @@ def main():
                          "discard episodes that never cross; 'fixed': keep all, full length.")
     ap.add_argument("--min_len", type=int, default=40,
                     help="Discard imagined episodes shorter than this after truncation.")
+    ap.add_argument("--keep_failures", action="store_true",
+                    help="Keep rollouts that never reach the terminal angle (stored at full "
+                         "--ep_len) instead of discarding them. Required for DAgger, where "
+                         "the student's failure states are the point; also used for the "
+                         "off-policy arm so both arms share one filtering rule and the only "
+                         "difference between them is whose states/labels the data carries.")
     ap.add_argument("--save_rejects_dir", default=None,
                     help="If set, save every DISCARDED imagined episode as an mp4 here "
                          "(full ep_len rollout, final estimated T angle in the filename).")
@@ -260,6 +286,20 @@ def main():
     ap.add_argument("--random_init", action="store_true",
                     help="Per-episode random T XY (+-0.08, upright) + random arm settle, "
                          "matching the varied-init real protocol. Default: fixed init.")
+    ap.add_argument("--x_min", type=float, default=None,
+                    help="Init sampler x bounds (m). With --x_max/--y_min/--y_max, "
+                         "overrides the +-0.08 box used by --random_init.")
+    ap.add_argument("--x_max", type=float, default=None)
+    ap.add_argument("--y_min", type=float, default=None)
+    ap.add_argument("--y_max", type=float, default=None)
+    ap.add_argument("--feasible_mask", default=None,
+                    help="Reject inits whose POST-SETTLE T position falls outside this "
+                         "mask (out-of-grid also rejected). Keeps imagined-rollout inits "
+                         "on the same distribution as training and evaluation.")
+    ap.add_argument("--labeler_ckpt", default=None,
+                    help="DAgger: second policy that LABELS the hallucinated observations "
+                         "while --dp_ckpt drives the rollout. Default: label with the "
+                         "rollout policy itself (standard off-policy imagined data).")
     ap.add_argument("--env_seed_base", type=int, default=500_000,
                     help="Base seed for the per-episode real env resets (kept disjoint "
                          "from the tight-eval seed 7000).")
@@ -276,23 +316,54 @@ def main():
     wm.dec_infer_steps = 1
 
     print(f"Loading DP policy from {args.dp_ckpt} ...")
-    policy, n_obs, n_act = E.load_policy(args.dp_ckpt, device)
+    if bool(args.dp_ckpt) == bool(args.residual):
+        raise SystemExit("give exactly one of --dp_ckpt / --residual")
+    if args.residual:
+        from residual_policy import load_residual_policy
+        policy, n_obs, n_act = load_residual_policy(args.residual, device)
+        print(f"expert: residual (iter {policy.iter})", flush=True)
+    else:
+        policy, n_obs, n_act = E.load_policy(args.dp_ckpt, device)
     assert n_obs == 2, f"collector assumes n_obs_steps=2, got {n_obs}"
     print(f"  n_obs_steps={n_obs} n_action_steps={n_act}")
+    labeler = None
+    if args.labeler_ckpt:
+        print(f"DAgger: labeling with {args.labeler_ckpt}")
+        labeler, lo_, la_ = E.load_policy(args.labeler_ckpt, device)
+        assert (lo_, la_) == (n_obs, n_act), "labeler obs/action horizon must match"
 
     # Real env: supplies each episode's initial frame/state (and only that --
     # every transition afterwards is imagined).
     env = AlohaEnv("pusht")
     kin = KinHelper(robot_name="trossen_vx300s")
-    rng_xy = (-0.08, 0.08) if args.random_init else (0.0, 0.0)
-    gae.sample_pusht_pose = C.make_upright_pose_sampler(rng_xy, rng_xy)
-    print(f"init mode: {'RANDOM XY +-0.08 + arm settle' if args.random_init else 'fixed (0,0), no settle'}")
+    if args.x_min is not None:
+        rng_x, rng_y = (args.x_min, args.x_max), (args.y_min, args.y_max)
+    else:
+        rng_x = rng_y = (-0.08, 0.08) if args.random_init else (0.0, 0.0)
+    gae.sample_pusht_pose = C.make_upright_pose_sampler(rng_x, rng_y)
+    region = None
+    if args.feasible_mask:
+        _m = json.loads(Path(args.feasible_mask).read_text())
+        _mask = np.array(_m["mask"], bool)
+        _edges = np.array(_m["grid_cm"]["edges"])
+
+        def region(e):
+            st = e._env.task.get_observation(e._env.physics)["env_state"]
+            x_cm, y_cm = st[0] * 100, st[1] * 100
+            if not (_edges[0] <= x_cm < _edges[-1] and _edges[0] <= y_cm < _edges[-1]):
+                return False
+            return bool(_mask[int(np.digitize(x_cm, _edges) - 1),
+                              int(np.digitize(y_cm, _edges) - 1)])
+        print(f"feasible region: {_mask.sum()} cells ({args.feasible_mask})")
+    print(f"init mode: x{rng_x} y{rng_y}"
+          f"{' + arm settle' if args.random_init else ''}")
 
     rb = ReplayBuffer.create_empty_numpy()
     if args.video_dir:
         Path(args.video_dir).mkdir(parents=True, exist_ok=True)
 
     n_done = 0
+    n_fail_kept = 0
     n_attempted = 0
     batch_i = 0
     env_trial = 0
@@ -301,10 +372,12 @@ def main():
         bsz = args.batch
         t0 = time.time()
         img0, home_xy, frame0_u8, env_trial = get_initial_states(
-            env, kin, bsz, args.env_seed_base + args.seed, args.random_init, env_trial
+            env, kin, bsz, args.env_seed_base + args.seed, args.random_init, env_trial,
+            region=region,
         )
         imgs, states, actions = imagine_batch(
-            wm, policy, img0, home_xy, frame0_u8, bsz, args.ep_len, n_act, device
+            wm, policy, img0, home_xy, frame0_u8, bsz, args.ep_len, n_act, device,
+            labeler=labeler,
         )
         n_acc = 0
         for b in range(bsz):
@@ -316,6 +389,16 @@ def main():
                 # detector is anchored at the episode's actual T position.
                 templates, tc = make_templates(frame0_u8[b])
                 tf = find_terminal_frame(imgs[b], templates, tc)
+                if args.keep_failures and (tf is None or tf + 1 < args.min_len):
+                    # keep the whole rollout: a failure trajectory is still data
+                    rb.add_episode({
+                        "img": imgs[b], "state": states[b], "action": actions[b],
+                    })
+                    ep_lens.append(args.ep_len)
+                    n_done += 1
+                    n_acc += 1
+                    n_fail_kept += 1
+                    continue
                 if tf is None or tf + 1 < args.min_len:
                     if args.save_rejects_dir:
                         import cv2
@@ -364,6 +447,9 @@ def main():
     print(f"  episode lengths: min={ep_lens.min()} median={int(np.median(ep_lens))} "
           f"max={ep_lens.max()}  (real demos: 240-600)")
     print(f"  accept rate: {n_done}/{n_attempted} = {n_done / n_attempted:.2f}")
+    if args.keep_failures:
+        print(f"  kept {n_fail_kept} non-terminating rollouts "
+              f"({n_fail_kept / max(n_done,1)*100:.0f}% of stored episodes)")
 
 
 if __name__ == "__main__":
