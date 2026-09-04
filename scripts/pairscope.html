@@ -1,0 +1,659 @@
+<title>PairScope</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #0C1216; --panel: #151C22; --panel2: #10171C; --line: #26313A;
+    --ink: #E8EEF2; --muted: #8FA0AC; --faint: #5C6B76;
+    --wm: #E8A33D; --sim: #4FB8C9; --alert: #E05C5C;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+    --ui: "Archivo", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--ground); color: var(--ink); font-family: var(--ui);
+    font-size: 14px; line-height: 1.45;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+    padding: 14px 20px 10px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 19px; font-weight: 700; margin: 0; letter-spacing: .01em; }
+  header h1 .wm { color: var(--wm); } header h1 .sim { color: var(--sim); }
+  .stats { font-family: var(--mono); font-size: 12px; color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap; }
+  .stats b { color: var(--ink); font-weight: 500; }
+  .legend { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; gap: 14px; align-items: center; }
+  .chip { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  main { display: grid; grid-template-columns: minmax(420px, 1fr) minmax(380px, 560px); gap: 14px; padding: 14px 20px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; }
+  .panel h2 {
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--muted); margin: 0 0 10px;
+  }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  select, button {
+    background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 4px; font-family: var(--mono); font-size: 12px; padding: 4px 8px; cursor: pointer;
+  }
+  select:focus-visible, button:focus-visible { outline: 2px solid var(--sim); outline-offset: 1px; }
+  button.play { min-width: 64px; }
+  canvas.scatter { width: 100%; height: 380px; display: block; cursor: crosshair; border-radius: 4px; background: var(--panel2); }
+  .hint { font-size: 12px; color: var(--faint); margin-top: 6px; }
+  /* replay */
+  .replay video { width: 100%; border-radius: 4px; background: #000; display: block; image-rendering: pixelated; }
+  .vidlabels { display: flex; font-family: var(--mono); font-size: 11px; margin-top: 4px; }
+  .vidlabels span { flex: 1; text-align: center; }
+  .vidlabels .wm { color: var(--wm); } .vidlabels .sim { color: var(--sim); }
+  .stepper { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-family: var(--mono); font-size: 12px; flex-wrap: wrap; }
+  .stepper .frame { color: var(--muted); min-width: 110px; }
+  canvas.trace { width: 100%; height: 120px; display: block; margin-top: 10px; background: var(--panel2); border-radius: 4px; cursor: pointer; }
+  .detail { font-family: var(--mono); font-size: 12px; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+  .detail table { border-collapse: collapse; width: 100%; }
+  .detail td { padding: 2px 8px 2px 0; color: var(--muted); }
+  .detail td:nth-child(2) { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .novideo { color: var(--faint); font-size: 12px; padding: 30px 10px; text-align: center; border: 1px dashed var(--line); border-radius: 4px; }
+  /* table */
+  .tablewrap { grid-column: 1 / -1; }
+  .scroll { overflow-x: auto; max-height: 420px; overflow-y: auto; border: 1px solid var(--line); border-radius: 4px; }
+  table.win { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+  table.win th {
+    position: sticky; top: 0; background: var(--panel2); color: var(--muted); font-weight: 500;
+    text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--line); cursor: pointer; user-select: none; white-space: nowrap;
+  }
+  table.win th:first-child, table.win td:first-child { text-align: left; }
+  table.win td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--panel2); color: var(--ink); }
+  table.win tr { cursor: pointer; }
+  table.win tr:hover td { background: #1A232B; }
+  table.win tr.sel td { background: #223140; }
+  .vid-yes { color: var(--sim); } .vid-no { color: var(--faint); }
+  a, a:visited { color: var(--sim); }
+  .tabs { display: flex; gap: 4px; }
+  .tab {
+    background: none; border: 1px solid transparent; border-radius: 4px;
+    color: var(--muted); font-family: var(--mono); font-size: 12px; padding: 4px 10px; cursor: pointer;
+  }
+  .tab.on { color: var(--ink); background: var(--panel); border-color: var(--line); }
+  .tab:focus-visible { outline: 2px solid var(--sim); }
+  main[hidden] { display: none; }
+  /* relabel view */
+  table.res { border-collapse: collapse; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; width: 100%; }
+  table.res th { color: var(--muted); font-weight: 500; text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--line); }
+  table.res td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--panel2); }
+  table.res th:first-child, table.res td:first-child { text-align: left; }
+  .arm-pair { color: var(--wm); } .arm-relab { color: var(--sim); } .arm-open { color: var(--muted); }
+  canvas.rl { width: 100%; display: block; background: var(--panel2); border-radius: 4px; }
+  .note { font-size: 12.5px; color: var(--muted); line-height: 1.5; margin-top: 8px; }
+  .note b { color: var(--ink); font-weight: 600; }
+</style>
+
+<header>
+  <h1>Pair<span class="sim">Scope</span></h1>
+  <nav class="tabs" id="tabs">
+    <button class="tab on" data-view="windows">windows</button>
+    <button class="tab" data-view="relabel" id="tab-relabel">relabel study</button>
+    <button class="tab" data-view="scaling" id="tab-scaling">scaling law</button>
+  </nav>
+  <div class="stats" id="stats"></div>
+  <div class="legend">
+    <span><span class="chip" style="background:var(--wm)"></span>imagined (WM)</span>
+    <span><span class="chip" style="background:var(--sim)"></span>simulator</span>
+  </div>
+</header>
+
+<main id="view-scaling" hidden>
+  <section class="panel" style="grid-column:1/-1">
+    <h2>Real x imagined scaling surface
+      <select id="sc-metric" style="margin-left:8px">
+        <option value="indist">in-distribution eval (x &ge; -4cm)</option>
+        <option value="all">unfiltered eval (as published)</option>
+      </select>
+      <select id="sc-axis" style="margin-left:6px">
+        <option value="I">x-axis = imagined dose</option>
+        <option value="R">x-axis = real demos</option>
+      </select>
+    </h2>
+    <canvas class="rl" id="sccurve" style="height:330px"></canvas>
+    <div class="note" id="sc-note"></div>
+  </section>
+  <section class="panel">
+    <h2>Published grid (mean &plusmn; SEM over 3 seeds, n=50)</h2>
+    <table class="res" id="scgrid"></table>
+    <div class="note">Every published cell is an <b>epoch-5</b> model: <code>topk</code> monitored
+      <code>test_mean_score</code> while <code>rollout_every=99</code> meant it was never logged, so all
+      45 runs crashed at their first checkpoint after saving <code>latest.ckpt</code>. Comparisons within
+      the grid are valid (all runs treated identically); absolute numbers are not "converged".</div>
+  </section>
+  <section class="panel">
+    <h2>Region-v2 rerun <span id="sc-v2status" style="letter-spacing:0;text-transform:none"></span></h2>
+    <table class="res" id="scv2"></table>
+    <div class="note" id="sc-v2note"></div>
+  </section>
+</main>
+
+<main id="view-relabel" hidden>
+  <section class="panel">
+    <h2>Success rate — 20 real + 400 imagined, n=50 eval, 3 seeds</h2>
+    <table class="res" id="restable"></table>
+    <div class="note" id="resnote"></div>
+  </section>
+  <section class="panel">
+    <h2>How much did relabeling change the labels?</h2>
+    <canvas class="rl" id="driftchart" style="height:230px"></canvas>
+    <div class="note">Per-step label change |a′−a| by within-cycle drift.
+      <span style="color:var(--wm)">amber</span> = raw change (includes DDPM resampling
+      noise); <span style="color:var(--alert)">red</span> = CRN systematic component
+      (matched noise — the pure hallucination-induced shift, from Stage B);
+      dashes = drift-0 resampling floor; dots = per-step motion scale.</div>
+  </section>
+  <section class="panel">
+    <h2>|a′−a| distribution</h2>
+    <canvas class="rl" id="rlhist" style="height:170px"></canvas>
+  </section>
+  <section class="panel">
+    <h2>Per-episode label-change trace
+      <select id="rltrace-ep" style="margin-left:8px"></select></h2>
+    <canvas class="rl" id="rltrace" style="height:170px"></canvas>
+    <div class="note">Vertical lines = WM↔sim resyncs (every 64 frames). The change
+      dips right after each resync (plan 1 shares its conditioning between streams,
+      so only sampling noise remains) and grows with drift.</div>
+  </section>
+</main>
+
+<main id="view-windows">
+  <section class="panel">
+    <h2>Window scatter</h2>
+    <div class="controls">
+      x: <select id="ax"><option value="psnr">psnr_obs (dB)</option><option value="psnrp">psnr_plan (dB)</option><option value="drift">drift (frames)</option></select>
+      y: <select id="ay"><option value="kl">KL(p&#8214;q) (nats)</option><option value="mse">action MSE (&times;1e-4 m&sup2;)</option><option value="prog">&Delta;angle (deg)</option></select>
+      color: <select id="ac"><option value="drift">drift</option><option value="sh">shard</option><option value="vid">has video</option></select>
+      <select id="fdrift"><option value="">all drift</option></select>
+      <select id="fshard"><option value="">all shards</option></select>
+      <label style="font-size:12px;color:var(--muted)"><input type="checkbox" id="fvid"> video only</label>
+    </div>
+    <canvas class="scatter" id="scatter"></canvas>
+    <div class="hint">Click a point to inspect the chunk. Red lines = medians. Log scale is used for KL/MSE.</div>
+  </section>
+
+  <section class="panel replay">
+    <h2>Replay <span id="epname" style="color:var(--ink);text-transform:none;letter-spacing:0"></span></h2>
+    <div id="playerbox">
+      <div class="novideo" id="novideo">Select a chunk or episode with an embedded video.<br>Episodes with videos are marked <span class="vid-yes">&#9679;</span> in the table.</div>
+      <video id="vid" playsinline muted style="display:none"></video>
+      <div class="vidlabels" id="vlabels" style="display:none"><span class="wm">imagined W_t</span><span class="sim">simulator S_t</span></div>
+      <div class="stepper" id="stepper" style="display:none">
+        <button class="play" id="play">play</button>
+        <button id="b8">&#8722;8</button><button id="b1">&#8722;1</button>
+        <button id="f1">+1</button><button id="f8">+8</button>
+        <span class="frame" id="frameno"></span>
+        <button id="gowin" title="jump to selected chunk">go to chunk</button>
+      </div>
+      <canvas class="trace" id="trace" style="display:none"></canvas>
+    </div>
+    <div class="detail" id="detail"></div>
+  </section>
+
+  <section class="panel tablewrap">
+    <h2>Windows <span id="tcount" style="letter-spacing:0"></span></h2>
+    <div class="scroll"><table class="win" id="wtable"></table></div>
+    <div class="hint">Click headers to sort, rows to select. Only the first 800 rows of the current filter are rendered.</div>
+  </section>
+</main>
+
+<script>
+const D = /*__DATA__*/null;
+const FPS = 10;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const COL = { wm: css('--wm'), sim: css('--sim'), ink: css('--ink'), muted: css('--muted'),
+              faint: css('--faint'), line: css('--line'), alert: css('--alert') };
+const W = D.windows, N = W.t.length;
+const epKey = i => D.shards[W.sh[i]] + '/' + W.ep[i];
+const hasVid = i => epKey(i) in D.episodes;
+
+document.getElementById('stats').innerHTML =
+  `<span>windows <b>${N}</b></span><span>scored <b>${D.n_scored}</b></span>` +
+  `<span>R <b>${D.R}</b></span><span>psnr med <b>${D.psnr_median}</b> dB</span>` +
+  `<span>KL med <b>${D.kl_median}</b></span>` +
+  `<span>videos <b>${Object.keys(D.episodes).length}</b> eps</span>` +
+  `<span style="color:var(--faint)">${D.generated}</span>`;
+
+// filter dropdowns
+const drifts = [...new Set(W.drift)].sort((a, b) => a - b);
+drifts.forEach(d => fdrift.add(new Option('drift ' + d, d)));
+D.shards.forEach((s, i) => fshard.add(new Option('shard ' + s, i)));
+
+let sel = -1, filt = [];
+function applyFilter() {
+  const fd = fdrift.value === '' ? null : +fdrift.value;
+  const fs = fshard.value === '' ? null : +fshard.value;
+  filt = [];
+  for (let i = 0; i < N; i++) {
+    if (fd !== null && W.drift[i] !== fd) continue;
+    if (fs !== null && W.sh[i] !== fs) continue;
+    if (fvid.checked && !hasVid(i)) continue;
+    filt.push(i);
+  }
+  drawScatter(); renderTable();
+  tcount.textContent = '(' + filt.length + ' shown)';
+}
+
+// ---------- scatter ----------
+const sc = document.getElementById('scatter'), sctx = sc.getContext('2d');
+let pts = [];
+const isLog = k => k === 'kl' || k === 'mse';
+function val(k, i) { const v = W[k][i]; return v === null ? null : v; }
+function drawScatter() {
+  const dpr = devicePixelRatio || 1;
+  sc.width = sc.clientWidth * dpr; sc.height = sc.clientHeight * dpr;
+  sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const cw = sc.clientWidth, ch = sc.clientHeight, P = { l: 46, r: 10, t: 8, b: 26 };
+  sctx.clearRect(0, 0, cw, ch);
+  const xk = ax.value, yk = ay.value;
+  const xs = [], ys = [], idx = [];
+  for (const i of filt) {
+    let x = val(xk, i), y = val(yk, i);
+    if (x === null || y === null) continue;
+    if (isLog(xk)) x = Math.log10(Math.max(x, 1e-3));
+    if (isLog(yk)) y = Math.log10(Math.max(y, 1e-3));
+    xs.push(x); ys.push(y); idx.push(i);
+  }
+  if (!xs.length) { pts = []; return; }
+  const mn = a => Math.min(...a), mx = a => Math.max(...a);
+  let x0 = mn(xs), x1 = mx(xs), y0 = mn(ys), y1 = mx(ys);
+  const padx = (x1 - x0) * .04 + 1e-9, pady = (y1 - y0) * .04 + 1e-9;
+  x0 -= padx; x1 += padx; y0 -= pady; y1 += pady;
+  const X = x => P.l + (x - x0) / (x1 - x0) * (cw - P.l - P.r);
+  const Y = y => ch - P.b - (y - y0) / (y1 - y0) * (ch - P.t - P.b);
+  // axes ticks
+  sctx.font = '10px ' + css('--mono'); sctx.fillStyle = COL.muted;
+  sctx.strokeStyle = COL.line; sctx.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const tx = x0 + (x1 - x0) * k / 4, ty = y0 + (y1 - y0) * k / 4;
+    const lx = isLog(xk) ? Math.pow(10, tx) : tx, ly = isLog(yk) ? Math.pow(10, ty) : ty;
+    sctx.textAlign = 'center';
+    sctx.fillText(lx.toPrecision(3), X(tx), ch - 8);
+    sctx.textAlign = 'right';
+    sctx.fillText(ly.toPrecision(3), P.l - 5, Y(ty) + 3);
+    sctx.beginPath(); sctx.moveTo(P.l, Y(ty)); sctx.lineTo(cw - P.r, Y(ty)); sctx.globalAlpha = .35; sctx.stroke(); sctx.globalAlpha = 1;
+  }
+  // medians
+  const med = a => { const b = [...a].sort((p, q) => p - q); return b[b.length >> 1]; };
+  sctx.strokeStyle = COL.alert; sctx.globalAlpha = .6;
+  sctx.beginPath(); sctx.moveTo(X(med(xs)), P.t); sctx.lineTo(X(med(xs)), ch - P.b); sctx.stroke();
+  sctx.beginPath(); sctx.moveTo(P.l, Y(med(ys))); sctx.lineTo(cw - P.r, Y(med(ys))); sctx.stroke();
+  sctx.globalAlpha = 1;
+  // points
+  pts = [];
+  const ck = ac.value;
+  const driftHue = d => { const f = (d - 8) / Math.max(1, (D.R - 24)); // amber->red as drift grows
+    return `rgba(${232}, ${Math.round(163 - 110 * f)}, ${61}, .55)`; };
+  const shardCol = ['#4FB8C9', '#E8A33D', '#9A7FD1', '#7FBF7F'];
+  for (let j = 0; j < idx.length; j++) {
+    const i = idx[j], x = X(xs[j]), y = Y(ys[j]);
+    let c;
+    if (ck === 'drift') c = driftHue(W.drift[i]);
+    else if (ck === 'sh') c = shardCol[W.sh[i] % 4] + '88';
+    else c = hasVid(i) ? COL.sim : 'rgba(92,107,118,.35)';
+    sctx.fillStyle = c;
+    sctx.beginPath(); sctx.arc(x, y, i === sel ? 5 : 2.2, 0, 7); sctx.fill();
+    if (i === sel) { sctx.strokeStyle = COL.ink; sctx.stroke(); }
+    pts.push([x, y, i]);
+  }
+}
+sc.addEventListener('click', e => {
+  const r = sc.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  let best = -1, bd = 144;
+  for (const [px, py, i] of pts) { const d = (px - x) ** 2 + (py - y) ** 2; if (d < bd) { bd = d; best = i; } }
+  if (best >= 0) select(best);
+});
+
+// ---------- table ----------
+const cols = [['ep', i => epKey(i)], ['t', i => W.t[i]], ['drift', i => W.drift[i]],
+  ['psnr_obs', i => W.psnr[i]], ['psnr_plan', i => W.psnrp[i]], ['KL', i => W.kl[i] ?? '—'],
+  ['MSE e-4', i => W.mse[i] ?? '—'], ['Δang', i => W.prog[i]], ['vid', i => hasVid(i) ? '●' : '○']];
+let sortk = 3, sortdir = -1;
+function renderTable() {
+  const t = document.getElementById('wtable');
+  const rows = [...filt];
+  const key = j => { const v = cols[sortk][1](j); return typeof v === 'number' ? v : (v === '—' ? -1e9 : String(v)); };
+  rows.sort((a, b) => (key(a) > key(b) ? 1 : -1) * sortdir);
+  let h = '<tr>' + cols.map((c, k) =>
+    `<th data-k="${k}">${c[0]}${k === sortk ? (sortdir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('') + '</tr>';
+  for (const i of rows.slice(0, 800)) {
+    h += `<tr data-i="${i}" class="${i === sel ? 'sel' : ''}">` + cols.map((c, k) =>
+      `<td class="${k === 8 ? (hasVid(i) ? 'vid-yes' : 'vid-no') : ''}">${c[1](i)}</td>`).join('') + '</tr>';
+  }
+  t.innerHTML = h;
+}
+wtable.addEventListener('click', e => {
+  const th = e.target.closest('th'), tr = e.target.closest('tr[data-i]');
+  if (th) { const k = +th.dataset.k; sortdir = (k === sortk) ? -sortdir : -1; sortk = k; renderTable(); }
+  else if (tr) select(+tr.dataset.i);
+});
+
+// ---------- replay ----------
+const vid = document.getElementById('vid'), trace = document.getElementById('trace');
+let curEp = null;
+function loadEpisode(key) {
+  if (curEp === key) return;
+  curEp = key;
+  const e = D.episodes[key];
+  document.getElementById('epname').textContent = ' — ' + key + ` (${e.len}f, seed ${e.seed})`;
+  novideo.style.display = 'none';
+  for (const id of ['vid', 'vlabels', 'stepper', 'trace']) document.getElementById(id).style.display = '';
+  vid.src = e.video;
+  vid.onloadeddata = drawTrace;
+  vid.ontimeupdate = drawTrace;
+}
+function frameNow() { return Math.round(vid.currentTime * FPS); }
+function seekFrame(f) { const e = D.episodes[curEp]; vid.pause(); vid.currentTime = Math.max(0, Math.min(e.len - 1, f)) / FPS + 1e-4; }
+play.onclick = () => { if (vid.paused) { vid.play(); play.textContent = 'pause'; } else { vid.pause(); play.textContent = 'play'; } };
+vid.onpause = () => play.textContent = 'play';
+b1.onclick = () => seekFrame(frameNow() - 1); f1.onclick = () => seekFrame(frameNow() + 1);
+b8.onclick = () => seekFrame(frameNow() - 8); f8.onclick = () => seekFrame(frameNow() + 8);
+gowin.onclick = () => { if (sel >= 0 && epKey(sel) === curEp) seekFrame(W.t[sel] - 1); };
+function drawTrace() {
+  if (!curEp) return;
+  const e = D.episodes[curEp], dpr = devicePixelRatio || 1;
+  trace.width = trace.clientWidth * dpr; trace.height = trace.clientHeight * dpr;
+  const c = trace.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const cw = trace.clientWidth, ch = trace.clientHeight, P = { l: 30, r: 30, t: 6, b: 14 };
+  const X = f => P.l + f / (e.len - 1) * (cw - P.l - P.r);
+  c.clearRect(0, 0, cw, ch);
+  // psnr trace (amber, left axis) skipping frame 0 (=inf/-1)
+  const pv = e.psnr.slice(1).filter(v => v > 0);
+  const p0 = Math.min(...pv), p1 = Math.max(...pv);
+  const Yp = v => ch - P.b - (v - p0) / (p1 - p0 + 1e-9) * (ch - P.t - P.b);
+  // resync boundaries
+  c.strokeStyle = COL.line;
+  for (let f = D.R; f < e.len; f += D.R) { c.beginPath(); c.moveTo(X(f), P.t); c.lineTo(X(f), ch - P.b); c.stroke(); }
+  // chunk ticks for trainable windows
+  c.fillStyle = COL.faint;
+  for (const wi of e.widx) { c.fillRect(X(W.t[wi] - 1), ch - P.b, Math.max(2, X(16) - X(0)), 3); }
+  c.strokeStyle = COL.wm; c.lineWidth = 1.4; c.beginPath();
+  e.psnr.forEach((v, f) => { if (f === 0 || v < 0) return; const x = X(f), y = Yp(v); f === 1 ? c.moveTo(x, y) : c.lineTo(x, y); });
+  c.stroke();
+  // angle trace (cyan, right axis)
+  const a0 = Math.min(...e.angle), a1 = Math.max(...e.angle);
+  const Ya = v => ch - P.b - (v - a0) / (a1 - a0 + 1e-9) * (ch - P.t - P.b);
+  c.strokeStyle = COL.sim; c.lineWidth = 1.2; c.beginPath();
+  e.angle.forEach((v, f) => { const x = X(f), y = Ya(v); f === 0 ? c.moveTo(x, y) : c.lineTo(x, y); });
+  c.stroke();
+  // playhead + labels
+  const f = frameNow();
+  c.strokeStyle = COL.ink; c.beginPath(); c.moveTo(X(f), P.t); c.lineTo(X(f), ch - P.b); c.stroke();
+  c.font = '10px ' + css('--mono');
+  c.fillStyle = COL.wm; c.textAlign = 'left'; c.fillText(p1.toFixed(0) + 'dB', 2, P.t + 8); c.fillText(p0.toFixed(0), 2, ch - P.b);
+  c.fillStyle = COL.sim; c.textAlign = 'right'; c.fillText(a1.toFixed(0) + '°', cw - 2, P.t + 8); c.fillText(a0.toFixed(0) + '°', cw - 2, ch - P.b);
+  frameno.textContent = `frame ${f}/${e.len - 1}  psnr ${e.psnr[f] > 0 ? e.psnr[f] : '—'}`;
+}
+trace.addEventListener('click', e => {
+  if (!curEp) return;
+  const r = trace.getBoundingClientRect(), ep = D.episodes[curEp];
+  seekFrame(Math.round((e.clientX - r.left - 30) / (trace.clientWidth - 60) * (ep.len - 1)));
+});
+
+// ---------- selection ----------
+function select(i) {
+  sel = i;
+  const k = epKey(i);
+  document.getElementById('detail').innerHTML = '<table>' + [
+    ['window', k + ' @ t=' + W.t[i]], ['obs frames', `(W_${W.t[i] - 1}, W_${W.t[i]})`],
+    ['drift since resync', W.drift[i] + ' frames'],
+    ['psnr_obs / plan', W.psnr[i] + ' / ' + W.psnrp[i] + ' dB'],
+    ['KL(p‖q) exec-8', (W.kl[i] ?? '—') + ' nats'],
+    ['action MSE (16-step)', W.mse[i] === null ? '—' : W.mse[i] + 'e-4 m²'],
+    ['Δ T-angle over plan', W.prog[i] + '°'],
+  ].map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('') + '</table>';
+  if (hasVid(i)) { loadEpisode(k); seekFrame(W.t[i] - 1); }
+  drawScatter(); renderTable();
+}
+
+// ---------- scaling-law tab ----------
+const SC = D.scaling;
+if (!SC) document.getElementById('tab-scaling').style.display = 'none';
+const SCCOL = ['#4FB8C9', '#E8A33D', '#9A7FD1', '#7FBF7F', '#E05C5C'];
+function drawScaling() {
+  if (!SC || document.getElementById('view-scaling').hidden) return;
+  const metric = document.getElementById('sc-metric').value;
+  const byI = document.getElementById('sc-axis').value === 'I';
+  const key = metric === 'all' ? 'mean_all' : 'mean_indist';
+  const skey = metric === 'all' ? 'sem_all' : 'sem_indist';
+  const [c, cw, ch] = setupCanvas(document.getElementById('sccurve'));
+  const P = { l: 48, r: 130, t: 12, b: 34 };
+  const xsVals = byI ? SC.pub_I : SC.pub_R;
+  const series = byI ? SC.pub_R : SC.pub_I;
+  const X = k => P.l + k / Math.max(xsVals.length - 1, 1) * (cw - P.l - P.r);
+  const Y = v => ch - P.b - v / 100 * (ch - P.t - P.b);
+  c.strokeStyle = COL.line; c.fillStyle = COL.muted; c.textAlign = 'right';
+  for (let g = 0; g <= 5; g++) {
+    const v = g * 20;
+    c.globalAlpha = .35; c.beginPath(); c.moveTo(P.l, Y(v)); c.lineTo(cw - P.r, Y(v)); c.stroke(); c.globalAlpha = 1;
+    c.fillText(v + '%', P.l - 5, Y(v) + 3);
+  }
+  c.textAlign = 'center';
+  xsVals.forEach((v, k) => c.fillText(String(v), X(k), ch - 12));
+  c.fillText(byI ? 'imagined episodes (I)' : 'real demos (R)', (P.l + cw - P.r) / 2, ch - 1);
+  series.forEach((s, si) => {
+    const col = SCCOL[si % SCCOL.length];
+    c.strokeStyle = col; c.lineWidth = 2; c.beginPath();
+    let started = false;
+    xsVals.forEach((xv, k) => {
+      const cell = SC.published[byI ? `${s},${xv}` : `${xv},${s}`];
+      if (!cell) return;
+      const x = X(k), y = Y(cell[key]);
+      started ? c.lineTo(x, y) : c.moveTo(x, y); started = true;
+    });
+    c.stroke();
+    xsVals.forEach((xv, k) => {
+      const cell = SC.published[byI ? `${s},${xv}` : `${xv},${s}`];
+      if (!cell) return;
+      const x = X(k), y = Y(cell[key]), e = cell[skey] / 100 * (ch - P.t - P.b);
+      c.strokeStyle = col; c.globalAlpha = .6; c.beginPath();
+      c.moveTo(x, y - e); c.lineTo(x, y + e); c.stroke(); c.globalAlpha = 1;
+      c.fillStyle = col; c.beginPath(); c.arc(x, y, 3.5, 0, 7); c.fill();
+    });
+    c.fillStyle = col; c.textAlign = 'left'; c.font = '11px ' + css('--mono');
+    c.fillText(`${byI ? 'R' : 'I'}=${s}`, cw - P.r + 8, P.t + 14 + si * 15);
+  });
+  c.fillStyle = COL.muted; c.font = '10px ' + css('--mono'); c.textAlign = 'left';
+  c.fillText('success %', 4, 10);
+  document.getElementById('sc-note').innerHTML =
+    `Published sweep, 45 runs (15 cells x 3 seeds), n=50 episodes each. ` +
+    (metric === 'indist'
+      ? `Recomputed on the <b>${'' }in-distribution</b> subset (x &ge; -4cm, ~42/50 episodes): the shape is
+         unchanged from the published numbers, every cell just sits 6-9 points higher.`
+      : `<b>Unfiltered</b>, exactly as published: ~16% of each eval draws inits from the censored
+         x &lt; -4cm band where every policy scores ~0-8%, dragging all cells down.`);
+  // published table
+  const gridEl = document.getElementById('scgrid');
+  let h = '<tr><th>R \\ I</th>' + SC.pub_I.map(i => `<th>${i}</th>`).join('') + '</tr>';
+  for (const R of SC.pub_R) {
+    h += `<tr><td>${R}</td>` + SC.pub_I.map(I => {
+      const g = SC.published[`${R},${I}`];
+      return `<td>${g ? `${g[key].toFixed(1)} <span style="color:var(--faint)">&plusmn;${g[skey].toFixed(1)}</span>` : '&mdash;'}</td>`;
+    }).join('') + '</tr>';
+  }
+  gridEl.innerHTML = h;
+  // v2 rerun table (correct protocol only; superseded numbers shown separately)
+  const nEv = o => Object.values(o || {}).reduce((a, v) => a + Object.keys(v).length, 0);
+  document.getElementById('sc-v2status').innerHTML =
+    `<span style="color:var(--muted);font-size:11px">` +
+    `${nEv(SC.v2)}/${SC.v2_total_runs} evals &middot; ${SC.v2_trained}/${SC.v2_total_runs} trained` +
+    (nEv(SC.dagger) ? ` &middot; DAgger ${nEv(SC.dagger)}/${SC.dagger_total_runs}` : '') + `</span>`;
+  const cellTxt = (src, R, I, cls) => {
+    const s = src[`${R},${I}`];
+    if (!s) return '<td style="color:var(--faint)">&middot;</td>';
+    const vals = Object.values(s);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    return `<td class="${cls || ''}">${mean.toFixed(1)}` +
+           `<span style="color:var(--faint)"> (${vals.length}s)</span></td>`;
+  };
+  let h2 = '<tr><th>R \\ I</th>' + SC.v2_I.map(i => `<th>${i}</th>`).join('') + '</tr>';
+  for (const R of SC.v2_R)
+    h2 += `<tr><td>${R}</td>` + SC.v2_I.map(I => cellTxt(SC.v2, R, I)).join('') + '</tr>';
+  if (nEv(SC.dagger)) {
+    h2 += `<tr><td colspan="${SC.v2_I.length + 1}" style="padding-top:10px;color:var(--sim)">` +
+          `DAgger (student states, expert labels, in-WM)</td></tr>`;
+    for (const R of SC.v2_R)
+      h2 += `<tr><td>${R}</td>` + SC.v2_I.map(I =>
+        I === 0 ? cellTxt(SC.v2, R, 0) : cellTxt(SC.dagger, R, I, 'arm-relab')).join('') + '</tr>';
+  }
+  document.getElementById('scv2').innerHTML = h2;
+  if (nEv(SC.v2_old)) {
+    let h3 = '<div class="note" style="margin-top:12px"><b>Superseded</b> (old eval protocol: ' +
+      'sampler left at &plusmn;8cm, so ~5% of accepted inits had drifted in from outside the ' +
+      'region and the within-region density differed from what training saw). Kept only to ' +
+      'measure the protocol\'s effect once the corrected numbers land:<br><span class="mono">';
+    h3 += SC.v2_R.map(R => SC.v2_I.map(I => {
+      const s = SC.v2_old[`${R},${I}`];
+      return s ? `r${R}i${I}=${Object.values(s)[0]}` : null;
+    }).filter(Boolean).join('  ')).filter(Boolean).join('  ');
+    document.getElementById('sc-v2note').insertAdjacentHTML('afterend', h3 + '</span></div>');
+  }
+  document.getElementById('sc-v2note').innerHTML =
+    `Rerun on <b>feasible region v2</b> (${SC.region_v2.bounds}; ${SC.region_v2.cells} cells, ` +
+    `${SC.region_v2.area_pct}% of the &plusmn;8cm square, expert measured ${SC.region_v2.measured}% there). ` +
+    `Region applied to training inits, imagined rollouts and evaluation alike. ` +
+    `<b>Not comparable to the published grid</b>: different region, a real expert, corrected LR schedule, ` +
+    `and 21 epochs that now actually complete instead of crashing at 5. Cells fill in as the sweep runs.`;
+}
+for (const id of ['sc-metric', 'sc-axis'])
+  document.getElementById(id).onchange = drawScaling;
+
+for (const el of [ax, ay, ac]) el.onchange = drawScatter;
+for (const el of [fdrift, fshard, fvid]) el.onchange = applyFilter;
+addEventListener('resize', () => { drawScatter(); drawTrace(); drawRelabel(); });
+applyFilter();
+
+// ---------- relabel study tab ----------
+const RL = D.relabel;
+if (!RL) document.getElementById('tab-relabel').style.display = 'none';
+document.getElementById('tabs').addEventListener('click', e => {
+  const b = e.target.closest('.tab'); if (!b) return;
+  for (const t of document.querySelectorAll('.tab')) t.classList.toggle('on', t === b);
+  for (const v of ['windows', 'relabel', 'scaling'])
+    document.getElementById('view-' + v).hidden = b.dataset.view !== v;
+  if (b.dataset.view === 'relabel') drawRelabel();
+  if (b.dataset.view === 'scaling') drawScaling();
+});
+function setupCanvas(cv) {
+  const dpr = devicePixelRatio || 1;
+  cv.width = cv.clientWidth * dpr; cv.height = cv.clientHeight * dpr;
+  const c = cv.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, cv.clientWidth, cv.clientHeight);
+  c.font = '10px ' + css('--mono');
+  return [c, cv.clientWidth, cv.clientHeight];
+}
+if (RL) {
+  const r = RL.results;
+  document.getElementById('restable').innerHTML =
+    '<tr><th>arm</th><th>s1</th><th>s2</th><th>s3</th><th>mean ± SEM</th></tr>' +
+    [['arm-open', 'i400 open-loop (published, no resync)', r.i400_openloop],
+     ['arm-pair', 'pair400 — original actions π(a|w)', r.pair400],
+     ['arm-relab', 'relab400 — expert-at-sim π(a|s)', r.relab400],
+     ...(r.retr400 ? [
+       ['arm-open', 'retr400 — STRAP retrieval π(a|s_closest), warped', r.retr400],
+       ['arm-open', 'retrv400 — STRAP retrieval, verbatim chunks', r.retrv400]] : [])]
+      .map(([cls, name, v]) =>
+        `<tr><td class="${cls}">${name}</td>` + v.seeds.map(s => `<td>${s}</td>`).join('') +
+        `<td><b>${v.mean.toFixed(1)} ± ${v.sem.toFixed(1)}</b></td></tr>`).join('');
+  document.getElementById('resnote').innerHTML =
+    `Sim relabeling is performance-neutral (44.0 vs 44.7) — but STRAP-retrieval relabels ` +
+    `collapse below the 20-real-only floor (~9%): cross-scene expert actions teach ` +
+    `confidently wrong obs→action mappings. Label validity is about the actual scene, ` +
+    `not conditioning fidelity. <b>${RL.n_frames.toLocaleString()}</b> imagined frames compared; ` +
+    `retrieval gallery: <a href="retrieval.html">retrieval.html</a> (local server only).`;
+  const eps = Object.keys(RL.traces);
+  const sel = document.getElementById('rltrace-ep');
+  eps.forEach(k => sel.add(new Option(k, k)));
+  sel.onchange = drawRelabel;
+}
+function drawRelabel() {
+  if (!RL || document.getElementById('view-relabel').hidden) return;
+  // drift profile
+  {
+    const [c, cw, ch] = setupCanvas(document.getElementById('driftchart'));
+    const P = { l: 40, r: 10, t: 12, b: 24 };
+    const drifts = Object.keys(RL.by_drift).map(Number).sort((a, b) => a - b);
+    const ymax = Math.max(...drifts.map(d => RL.by_drift[d].raw_p90)) * 1.05;
+    const X = i => P.l + (i + .5) / drifts.length * (cw - P.l - P.r);
+    const Y = v => ch - P.b - v / ymax * (ch - P.t - P.b);
+    c.strokeStyle = COL.line;
+    for (let g = 0; g <= 4; g++) {
+      const v = ymax * g / 4;
+      c.globalAlpha = .35; c.beginPath(); c.moveTo(P.l, Y(v)); c.lineTo(cw - P.r, Y(v)); c.stroke(); c.globalAlpha = 1;
+      c.fillStyle = COL.muted; c.textAlign = 'right'; c.fillText(v.toFixed(1), P.l - 4, Y(v) + 3);
+    }
+    // reference lines
+    c.setLineDash([5, 4]); c.strokeStyle = COL.faint;
+    c.beginPath(); c.moveTo(P.l, Y(RL.floor_cm.mean)); c.lineTo(cw - P.r, Y(RL.floor_cm.mean)); c.stroke();
+    c.setLineDash([2, 3]);
+    c.beginPath(); c.moveTo(P.l, Y(RL.motion_cm.mean)); c.lineTo(cw - P.r, Y(RL.motion_cm.mean)); c.stroke();
+    c.setLineDash([]);
+    c.fillStyle = COL.faint; c.textAlign = 'left';
+    c.fillText('resample floor ' + RL.floor_cm.mean + 'cm', P.l + 4, Y(RL.floor_cm.mean) - 4);
+    c.fillText('motion/step ' + RL.motion_cm.mean + 'cm', P.l + 4, Y(RL.motion_cm.mean) - 4);
+    // bars (raw) + CRN line
+    drifts.forEach((d, i) => {
+      const v = RL.by_drift[d];
+      c.fillStyle = 'rgba(232,163,61,.55)';
+      const bw = (cw - P.l - P.r) / drifts.length * .55;
+      c.fillRect(X(i) - bw / 2, Y(v.raw_mean), bw, ch - P.b - Y(v.raw_mean));
+      c.fillStyle = COL.muted; c.textAlign = 'center'; c.fillText(String(d), X(i), ch - 8);
+    });
+    c.strokeStyle = COL.alert; c.lineWidth = 1.6; c.beginPath();
+    let started = false;
+    drifts.forEach((d, i) => {
+      const v = RL.by_drift[d].crn_mean; if (v === null) return;
+      started ? c.lineTo(X(i), Y(v)) : c.moveTo(X(i), Y(v)); started = true;
+      c.fillStyle = COL.alert; c.fillRect(X(i) - 2, Y(v) - 2, 4, 4);
+    });
+    c.stroke();
+    c.fillStyle = COL.muted; c.textAlign = 'left';
+    c.fillText('cm / step', 4, 10);
+  }
+  // histogram
+  {
+    const [c, cw, ch] = setupCanvas(document.getElementById('rlhist'));
+    const P = { l: 34, r: 8, t: 8, b: 22 };
+    const h = RL.hist, m = Math.max(...h.counts);
+    const n = h.counts.length;
+    h.counts.forEach((v, i) => {
+      c.fillStyle = 'rgba(232,163,61,.55)';
+      const x0 = P.l + i / n * (cw - P.l - P.r), w = (cw - P.l - P.r) / n - 1;
+      const y = ch - P.b - v / m * (ch - P.t - P.b);
+      c.fillRect(x0, y, w, ch - P.b - y);
+    });
+    c.fillStyle = COL.muted; c.textAlign = 'center';
+    for (let g = 0; g <= 4; g++) {
+      const cm = h.edges[0] + (h.edges[n] - h.edges[0]) * g / 4;
+      c.fillText(cm.toFixed(0) + 'cm', P.l + g / 4 * (cw - P.l - P.r), ch - 6);
+    }
+    c.strokeStyle = COL.ink;
+    const med = RL.raw_cm.median, xm = P.l + (med - h.edges[0]) / (h.edges[n] - h.edges[0]) * (cw - P.l - P.r);
+    c.beginPath(); c.moveTo(xm, P.t); c.lineTo(xm, ch - P.b); c.stroke();
+    c.textAlign = 'left'; c.fillStyle = COL.ink;
+    c.fillText('median ' + med + 'cm', xm + 4, P.t + 9);
+  }
+  // trace
+  {
+    const [c, cw, ch] = setupCanvas(document.getElementById('rltrace'));
+    const P = { l: 34, r: 8, t: 8, b: 20 };
+    const tr = RL.traces[document.getElementById('rltrace-ep').value || Object.keys(RL.traces)[0]];
+    if (!tr) return;
+    const m = Math.max(...tr) * 1.05;
+    const X = f => P.l + f / (tr.length - 1) * (cw - P.l - P.r);
+    const Y = v => ch - P.b - v / m * (ch - P.t - P.b);
+    c.strokeStyle = COL.line;
+    for (let f = RL.R; f < tr.length; f += RL.R) { c.beginPath(); c.moveTo(X(f), P.t); c.lineTo(X(f), ch - P.b); c.stroke(); }
+    c.strokeStyle = COL.wm; c.lineWidth = 1.2; c.beginPath();
+    tr.forEach((v, f) => f ? c.lineTo(X(f), Y(v)) : c.moveTo(X(f), Y(v)));
+    c.stroke();
+    c.fillStyle = COL.muted; c.textAlign = 'right';
+    c.fillText(m.toFixed(0) + 'cm', P.l - 3, P.t + 8); c.fillText('0', P.l - 3, ch - P.b);
+    c.textAlign = 'center'; c.fillText('frame', cw / 2, ch - 5);
+  }
+}
+</script>
