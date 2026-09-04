@@ -321,8 +321,11 @@ def rotation_success(init_pose, final_pose, actions) -> tuple[bool, float]:
 @click.option("--invisible_t", is_flag=True,
               help="Render the T invisible (alpha=0) while keeping its physics: the demos "
                    "show only the arms, but they really are rotating the (unseen) block.")
+@click.option("--max_trials", default=None, type=int,
+              help="Stop after this many trials even if n_episodes successes were not "
+                   "reached (bounded collection for low-accept-rate init regions).")
 def main(output_dir, n_episodes, headless, seed, x_min, x_max, y_min, y_max, debug_dir,
-         no_settle, invisible_t):
+         no_settle, invisible_t, max_trials):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     if debug_dir:
         Path(debug_dir).mkdir(parents=True, exist_ok=True)
@@ -351,6 +354,10 @@ def main(output_dir, n_episodes, headless, seed, x_min, x_max, y_min, y_max, deb
           f"(starting at episode_{episode_id})")
 
     while episode_id < target_total:
+        if max_trials is not None and trial >= max_trials:
+            print(f"  [cap] reached max_trials={max_trials} with "
+                  f"{episode_id - init_episode_id}/{n_episodes} successes -- stopping")
+            break
         ep_seed = seed * 1_000_000 + trial
         trial += 1
         env.reset(seed=ep_seed)

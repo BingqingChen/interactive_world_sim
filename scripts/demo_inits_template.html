@@ -1,0 +1,150 @@
+<title>Demo Init Census</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;700&family=IBM+Plex+Mono&display=swap">
+<style>
+  body { background:#0C1216; color:#E8EEF2; font-family:Archivo,system-ui,sans-serif; margin:0; padding:16px 20px; }
+  h1 { font-size:19px; margin:0 0 2px; } h1 .a { color:#E8A33D; }
+  .sub { font-family:"IBM Plex Mono",monospace; font-size:12px; color:#8FA0AC; margin-bottom:12px; }
+  .sub b { color:#E8EEF2; font-weight:500; }
+  .wrap { display:grid; grid-template-columns: minmax(420px,560px) 1fr; gap:14px; }
+  @media (max-width: 900px){ .wrap { grid-template-columns:1fr; } }
+  .panel { background:#151C22; border:1px solid #26313A; border-radius:6px; padding:12px; }
+  .panel h2 { font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:#8FA0AC; margin:0 0 8px; font-weight:600; }
+  canvas { display:block; background:#10171C; border-radius:4px; width:100%; }
+  .controls { display:flex; gap:10px; margin-bottom:8px; font-family:"IBM Plex Mono",monospace; font-size:12px; align-items:center; flex-wrap:wrap; color:#8FA0AC; }
+  select { background:#10171C; color:#E8EEF2; border:1px solid #26313A; border-radius:4px; font:inherit; padding:3px 6px; }
+  #tip { position:fixed; pointer-events:none; background:#1A232B; border:1px solid #26313A; border-radius:6px;
+         padding:8px; font-family:"IBM Plex Mono",monospace; font-size:11px; color:#E8EEF2; display:none; z-index:9; }
+  #tip img { width:108px; height:108px; image-rendering:pixelated; display:block; border-radius:3px; margin-bottom:5px; }
+  .note { font-size:12px; color:#5C6B76; margin-top:8px; line-height:1.5; }
+</style>
+<h1>Demo Init <span class="a">Census</span></h1>
+<div class="sub" id="hdr"></div>
+<div class="wrap">
+  <div class="panel">
+    <h2>Initial T position (post-settle) — 800 success-filtered random-init demos</h2>
+    <div class="controls">
+      color: <select id="cmode"><option value="len">episode length</option><option value="yaw">init yaw</option><option value="none">flat</option></select>
+      <label><input type="checkbox" id="grid" checked> 8×8 bin counts</label>
+      feasible mask: <select id="maskK"><option value="7" selected>density ≥7 (protocol v1)</option><option value="5">density ≥5</option><option value="3">density ≥3</option><option value="0">off</option></select>
+      <span id="maskstats"></span>
+    </div>
+    <canvas id="sc" style="aspect-ratio:1"></canvas>
+    <div class="note">Sampling was uniform over ±8 cm (dashed box) — empty regions are inits the
+    scripted collector rejected (failures) or the settle phase displaced. Hover points for the
+    episode's actual first frame. Red bin labels: &lt;50% of expected count.</div>
+  </div>
+  <div>
+    <div class="panel" style="margin-bottom:14px">
+      <h2>x marginal vs uniform</h2><canvas id="mx" style="height:130px"></canvas>
+    </div>
+    <div class="panel" style="margin-bottom:14px">
+      <h2>y marginal vs uniform</h2><canvas id="my" style="height:130px"></canvas>
+    </div>
+    <div class="panel">
+      <h2>episode length vs init x (difficulty gradient)</h2><canvas id="lx" style="height:170px"></canvas>
+    </div>
+  </div>
+</div>
+<div id="tip"><img id="tipimg"><div id="tiptxt"></div></div>
+<script>
+const D = /*__DATA__*/null;
+const rows = D.rows, N = rows.length; // [ep, x_cm, y_cm, yaw_deg, len]
+const hdr = document.getElementById('hdr');
+const lens = rows.map(r=>r[4]);
+hdr.innerHTML = `n <b>${N}</b> (rotate_t_1k/train eps 200–1000; eps 0–199 are fixed-init, excluded) · ` +
+  `x∈[${Math.min(...rows.map(r=>r[1])).toFixed(1)}, ${Math.max(...rows.map(r=>r[1])).toFixed(1)}] cm · ` +
+  `len median <b>${lens.slice().sort((a,b)=>a-b)[N>>1]}</b>f · sampling: uniform ±8 cm, success-only kept`;
+function setup(cv){ const d=devicePixelRatio||1; cv.width=cv.clientWidth*d; cv.height=cv.clientHeight*d;
+  const c=cv.getContext('2d'); c.setTransform(d,0,0,d,0,0); c.clearRect(0,0,cv.clientWidth,cv.clientHeight);
+  c.font='10px "IBM Plex Mono",monospace'; return [c,cv.clientWidth,cv.clientHeight]; }
+const lenCol = v => { const f=Math.min(1,Math.max(0,(v-120)/480));
+  return `rgb(${Math.round(79+f*153)},${Math.round(184-f*80)},${Math.round(201-f*140)})`; };
+const yawCol = v => { const f=(v+3)/6; return `rgb(${Math.round(232*f+79*(1-f))},${Math.round(163*f+184*(1-f))},${Math.round(61*f+201*(1-f))})`; };
+let pts=[];
+function drawScatter(){
+  const cv=document.getElementById('sc'), [c,w,h]=setup(cv);
+  const P=34, S=Math.min(w,h)-2*P, X=x=>P+(x+9)/18*S, Y=y=>h-P-(y+9)/18*S;
+  // sampled box
+  c.strokeStyle='#4FB8C9'; c.setLineDash([5,4]);
+  c.strokeRect(X(-8), Y(8), X(8)-X(-8), Y(-8)-Y(8)); c.setLineDash([]);
+  c.fillStyle='#8FA0AC'; c.textAlign='center';
+  for(const t of [-8,-4,0,4,8]){ c.fillText(t, X(t), h-10); c.textAlign='right'; c.fillText(t, P-6, Y(t)+3); c.textAlign='center'; }
+  c.fillText('x (cm)', w/2, h-0.5); c.save(); c.translate(10,h/2); c.rotate(-Math.PI/2); c.fillText('y (cm)',0,0); c.restore();
+  // feasible-mask overlay (8x8, 2cm cells, density threshold)
+  const K = +document.getElementById('maskK').value;
+  const MB = 8, mcnt = Array.from({length:MB},()=>Array(MB).fill(0));
+  for(const r of rows){ const i=Math.min(MB-1,Math.max(0,Math.floor((r[1]+8)/16*MB))),
+    j=Math.min(MB-1,Math.max(0,Math.floor((r[2]+8)/16*MB))); mcnt[i][j]++; }
+  if(K>0){
+    let feas=0, demos=0;
+    for(let i=0;i<MB;i++) for(let j=0;j<MB;j++){
+      const ok = mcnt[i][j] >= K; if(ok){ feas++; demos+=mcnt[i][j]; continue; }
+      const x0=X(-8+16*i/MB), y1=Y(-8+16*j/MB), x1=X(-8+16*(i+1)/MB), y0=Y(-8+16*(j+1)/MB);
+      c.fillStyle='rgba(224,92,92,.16)'; c.fillRect(x0,y0,x1-x0,y1-y0);
+      c.strokeStyle='rgba(224,92,92,.5)'; c.strokeRect(x0,y0,x1-x0,y1-y0);
+    }
+    document.getElementById('maskstats').textContent =
+      `${feas}/64 cells · ${(feas/64*100).toFixed(0)}% area · ${demos}/${N} demos kept`;
+  } else document.getElementById('maskstats').textContent='';
+  const mode=document.getElementById('cmode').value;
+  pts=[];
+  for(let i=0;i<N;i++){ const r=rows[i], x=X(r[1]), y=Y(r[2]);
+    c.fillStyle = mode==='len'?lenCol(r[4]) : mode==='yaw'?yawCol(r[3]) : 'rgba(232,163,61,.75)';
+    c.beginPath(); c.arc(x,y,3,0,7); c.fill(); pts.push([x,y,i]); }
+  if(document.getElementById('grid').checked){
+    const B=8, exp=N/(B*B), cnt=mcnt;
+    c.textAlign='center'; c.strokeStyle='rgba(38,49,58,.9)';
+    for(let i=0;i<=B;i++){ const g=-8+16*i/B;
+      c.beginPath(); c.moveTo(X(g),Y(-8)); c.lineTo(X(g),Y(8)); c.stroke();
+      c.beginPath(); c.moveTo(X(-8),Y(g)); c.lineTo(X(8),Y(g)); c.stroke(); }
+    for(let i=0;i<B;i++) for(let j=0;j<B;j++){
+      const cx=X(-8+16*(i+.5)/B), cy=Y(-8+16*(j+.5)/B);
+      c.fillStyle = cnt[i][j] < exp*0.5 ? '#E05C5C' : 'rgba(232,238,242,.85)';
+      c.font='bold 12px "IBM Plex Mono",monospace'; c.fillText(cnt[i][j], cx, cy+4);
+      c.font='10px "IBM Plex Mono",monospace'; }
+  }
+}
+const tip=document.getElementById('tip');
+document.getElementById('sc').addEventListener('mousemove', e=>{
+  const r=e.target.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top;
+  let best=-1,bd=110;
+  for(const [x,y,i] of pts){ const d=(x-mx)**2+(y-my)**2; if(d<bd){bd=d;best=i;} }
+  if(best<0){ tip.style.display='none'; return; }
+  const row=rows[best];
+  document.getElementById('tipimg').src='data:image/jpeg;base64,'+D.thumbs[best];
+  document.getElementById('tiptxt').innerHTML=`ep ${row[0]} · (${row[1]}, ${row[2]}) cm<br>yaw ${row[3]}° · ${row[4]} frames`;
+  tip.style.display='block';
+  tip.style.left=Math.min(innerWidth-140, e.clientX+14)+'px';
+  tip.style.top=(e.clientY-40)+'px';
+});
+document.getElementById('sc').addEventListener('mouseleave', ()=>tip.style.display='none');
+function marginal(id, vi){
+  const cv=document.getElementById(id), [c,w,h]=setup(cv);
+  const B=16, cnt=Array(B).fill(0);
+  for(const r of rows){ const k=Math.min(B-1,Math.max(0,Math.floor((r[vi]+8)/16*B))); cnt[k]++; }
+  const m=Math.max(...cnt), P={l:26,r:6,t:6,b:18};
+  cnt.forEach((v,k)=>{ c.fillStyle='rgba(232,163,61,.75)';
+    const x=P.l+k/B*(w-P.l-P.r), bw=(w-P.l-P.r)/B-1, y=h-P.b-v/m*(h-P.t-P.b);
+    c.fillRect(x,y,bw,h-P.b-y); });
+  const ey=h-P.b-(N/B)/m*(h-P.t-P.b);
+  c.strokeStyle='#4FB8C9'; c.setLineDash([4,3]); c.beginPath(); c.moveTo(P.l,ey); c.lineTo(w-P.r,ey); c.stroke(); c.setLineDash([]);
+  c.fillStyle='#8FA0AC'; c.textAlign='center';
+  for(const t of [-8,-4,0,4,8]) c.fillText(t, P.l+(t+8)/16*(w-P.l-P.r), h-4);
+  c.fillText('uniform', w-40, ey-4);
+}
+function lenScatter(){
+  const cv=document.getElementById('lx'), [c,w,h]=setup(cv);
+  const P={l:34,r:8,t:8,b:20}, lmax=Math.max(...lens);
+  const X=x=>P.l+(x+9)/18*(w-P.l-P.r), Y=v=>h-P.b-v/lmax*(h-P.t-P.b);
+  c.fillStyle='#8FA0AC'; c.textAlign='right';
+  for(const t of [200,400,600]){ c.fillText(t, P.l-4, Y(t)+3); }
+  c.textAlign='center'; for(const t of [-8,-4,0,4,8]) c.fillText(t, X(t), h-5);
+  for(const r of rows){ c.fillStyle='rgba(79,184,201,.5)'; c.beginPath(); c.arc(X(r[1]),Y(r[4]),2.4,0,7); c.fill(); }
+}
+function drawAll(){ drawScatter(); marginal('mx',1); marginal('my',2); lenScatter(); }
+document.getElementById('cmode').onchange=drawScatter;
+document.getElementById('maskK').onchange=drawScatter;
+document.getElementById('grid').onchange=drawScatter;
+addEventListener('resize', drawAll);
+drawAll();
+</script>
