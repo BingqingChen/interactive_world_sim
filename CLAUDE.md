@@ -91,6 +91,47 @@ bsub < jobs/train_stage1.bsub
 bsub < jobs/train_stage2.bsub
 ```
 
+## Data filing (project convention)
+
+Authoritative rules live in the companion repo: `../diffusion_policy/docs/data_filing_rules.md`
+(and `docs/archived_artifacts.md` for what has already been moved). The training
+artifacts are produced here, so the rules bind this repo's scripts.
+
+**The result is the eval JSON; the checkpoint is provenance.** A rotate-T checkpoint is
+4.3 GB; the JSON holding its number is 18 KB. The root filesystem has hit 98% twice and
+once aborted a 48-cell sweep mid-run, so accumulation — not any single file — is the
+failure mode.
+
+- **NVMe (`/`)** — training zarrs, pools, the current expert, `outputs/*/evals/*.json`,
+  rollout videos.
+- **`/data/storage/wm_archive/`** — evaluated checkpoints, kept indefinitely.
+- **`/data/storage/trash/`** — superseded; delete outright only what is provably invalid.
+
+`/data/storage` is a **spinning disk shared with another user** (191 MB/s vs 4.6 GB/s).
+**Never put an actively-read training zarr there** — training reads shuffled image
+chunks, near worst-case for that device.
+
+Any sweep driver must, without being asked (`scripts/run_scaling_v3_sweep.py` is the
+reference implementation):
+1. delete each per-cell zarr after that cell trains;
+2. **archive** that cell's checkpoints once its eval JSON exists — never delete; if the
+   archive is unreachable, leave them in place and report it;
+3. abort loudly on low free space (`MIN_FREE_GB`);
+4. keep `topk k` at 1–2;
+5. record `--n_videos 10` with a **per-cell `--video_dir`** — the eval default is a
+   single shared path, so otherwise every cell overwrites the last. Episode *k* is the
+   same initial state in every cell (`np.random.seed(seed + ep)`), so the clips are
+   comparable across a grid.
+
+**Check for load-bearing references before moving or deleting a checkpoint.** Paths
+hide inside saved artifacts: `outputs/ppo_v2/residual_*.pt` stores the absolute path of
+the frozen base checkpoint it loads at construction, so deleting that base silently
+destroys the 96% expert. Grep the repos, grep `outputs/*/*.json`, and load any adapter
+`.pt` to read the path inside it.
+
+Cross-device moves: `rsync -a --remove-source-files` (unlinks only after a verified
+transfer), never `mv`; record a size/mtime manifest before moving.
+
 ## Architecture
 
 ### Configuration System (Hydra)
