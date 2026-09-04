@@ -101,6 +101,34 @@ the same absolute path. None of the datasets, checkpoints or `outputs/` are in g
 science itself is ~65 MB of eval JSONs and videos, everything else is regenerable or
 large.
 
+## Logging experiments (project convention)
+
+**Every experiment gets written into the appropriate experiment log, always.** For
+rotate-T that is `../diffusion_policy/docs/experiment_log_push-T.md`; other task families get their own
+`../diffusion_policy/docs/experiment_<task>.md`. This is not optional and does not wait to be asked — a
+result that exists only in a JSON file or a terminal buffer is lost the moment the
+session ends.
+
+Log an experiment when it finishes, and record:
+
+- **what was run** — configs, data pools, seeds, the exact grid or condition;
+- **the numbers**, with n and a spread (mean ± SEM over seeds), not a single figure;
+- **the protocol**, or a pointer to it, including anything that makes the numbers
+  non-comparable to earlier results;
+- **negative and null results too** — they are why an approach was abandoned, and
+  rediscovering that costs more than writing it down;
+- **caveats that constrain interpretation** (what the error bars do and do not cover,
+  confounds, sample-size limits);
+- **bugs found**, especially ones that invalidated earlier runs. Several sweeps here
+  were silently ruined by config interactions that looked healthy in the logs.
+
+Correct the log when a later result overturns an earlier reading, rather than leaving
+both standing.
+
+**`../diffusion_policy/docs/key_results.md` is curated, not automatic.** Promote an experiment there only
+on explicit human instruction. It holds headline findings with links back to the full
+setup in the experiment log; everything else stays in the log.
+
 ## Data filing (project convention)
 
 Authoritative rules live in the companion repo: `../diffusion_policy/docs/data_filing_rules.md`
