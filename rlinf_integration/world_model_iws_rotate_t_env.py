@@ -163,6 +163,23 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         # (see module docstring), one row's episode got permanently stuck this way
         # after its first grid-boundary misread.
         self.stuck_reject_limit = int(cfg.get("stuck_reject_limit", 3))
+        # Consecutive morph_detected chunks required before actually truncating the
+        # episode. REVISED from immediate (patience=1) truncation after validating
+        # against the full 800-episode imagined pool (datasets/scaling_v3/imag/
+        # {half1,half2}.zarr): 348/800 episodes (43.5%) had >=1 morph_detected chunk,
+        # but only 21/800 (2.6%) ever reached a run of >=3 consecutive morph_detected
+        # chunks -- 81.2% of morph_detected runs are length 1. Of isolated
+        # (run-length<3) events with enough follow-up data, 98.8% (318/322) were
+        # clean again within the next 3 chunks -- visually confirmed several of
+        # these are transient one-frame WM rendering glitches (a dark smudge that
+        # clears by the next frame), not sustained hallucination, versus a directly
+        # confirmed genuine case (progressive mask growth over 13 consecutive
+        # chunks, visually unambiguous blob growth) that patience=3 still catches
+        # correctly, just 2 chunks later than immediate would have. Immediate
+        # truncation was discarding ~43% of episodes for events that self-correct
+        # ~99% of the time -- a real cost to online RL sample efficiency, not a
+        # safety-only tradeoff, since the world only has finite parallel envs.
+        self.morph_terminate_patience = int(cfg.get("morph_terminate_patience", 3))
         self.terminal_deg = float(cfg.get("terminal_deg", TERMINAL_DEG))
         self.dec_infer_steps = int(cfg.get("dec_infer_steps", 2))
         x_range = tuple(cfg.get("x_range", (-0.06, 0.06)))
@@ -271,6 +288,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
 
         self.angle_prev = torch.zeros(B, dtype=torch.float32)  # upright init => angle 0
         self._consec_reject = np.zeros(B, dtype=np.int64)  # for the stuck-prev recovery (see stuck_reject_limit)
+        self._consec_morph = np.zeros(B, dtype=np.int64)  # for morph_terminate_patience (see that field's comment)
         self.frame0_u8 = frame0_u8
         self._jump_reject_count = getattr(self, "_jump_reject_count", 0)
         self._lost_track_count = getattr(self, "_lost_track_count", 0)  # no mask / area sanity fail on every candidate frame
@@ -472,7 +490,18 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
             success = bool(angle_end <= np.radians(self.terminal_deg)) and not morph_detected
             rewards_last[b] = prog * 5.0 - 0.01 + (5.0 if success else 0.0)
             terminations_last[b] = success
-            morph_terminate[b] = morph_detected
+            # Patience, not immediate truncation -- see morph_terminate_patience's
+            # definition (_build_dataset) for the full-pool evidence this was
+            # necessary (immediate truncation discarded ~43% of episodes for
+            # single-chunk artifacts that self-correct ~99% of the time). The
+            # success-bonus suppression above still fires on ANY morph_detected
+            # chunk regardless of patience -- that's a separate, still-correct
+            # safety property (never credit success from an untrustworthy read).
+            if morph_detected:
+                self._consec_morph[b] += 1
+            else:
+                self._consec_morph[b] = 0
+            morph_terminate[b] = self._consec_morph[b] >= self.morph_terminate_patience
             self.angle_prev[b] = angle_end
         if morph_terminate.any():
             self._morph_terminate_count = getattr(self, "_morph_terminate_count", 0) + int(morph_terminate.sum())
