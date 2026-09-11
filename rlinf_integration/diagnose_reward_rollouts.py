@@ -37,7 +37,7 @@ def build_env(num_envs, seed_base, device):
         "n_action_steps": 8,
         "wm_max_chunks": 40,
         "jump_reject_deg": 47.5,
-        "min_iou": 0.5,
+        "min_iou": 0.35,
         "terminal_deg": -80.0,
         "dec_infer_steps": 2,
         "x_range": [-0.06, 0.06],
@@ -101,6 +101,7 @@ def main():
 
     print(f"Building env ({args.n_episodes} rows) ...", flush=True)
     env = build_env(args.n_episodes, args.seed_base, args.device)
+    env._debug_log = []  # opt-in: record raw (angle,iou,area) for every rejected read
     obs, _ = env.reset()
     # Freeze recording: don't let chunk_step's internal auto-reset truncate a row's
     # trajectory just because another row in the batch finished first.
@@ -156,11 +157,49 @@ def main():
             ))
         if step % 10 == 0:
             print(f"  step {step}/{wm_max_chunks}  lost={env._lost_track_count} "
-                  f"morph_reject={env._morph_reject_count} jump_reject={env._jump_reject_count}",
+                  f"morph_reject={env._morph_reject_count} jump_reject={env._jump_reject_count} "
+                  f"stuck_recovery={env._stuck_recovery_count}",
                   flush=True)
 
+    n_accepted = B * wm_max_chunks - env._lost_track_count - env._morph_reject_count - env._jump_reject_count
     print(f"lost_track={env._lost_track_count}  morph_reject={env._morph_reject_count}  "
-          f"jump_reject={env._jump_reject_count}  (out of {B * wm_max_chunks} chunk-reads)")
+          f"jump_reject={env._jump_reject_count}  stuck_recovery={env._stuck_recovery_count}  "
+          f"accepted={n_accepted}  (out of {B * wm_max_chunks} chunk-reads)")
+
+    # Summarize what actually drove each rejection -- the IoU/area of every candidate
+    # frame, not just the pass/fail counts, so a too-strict threshold is visible directly.
+    morph_ious = []  # best IoU seen among the (failed) candidates of each morph-reject event
+    for ev in env._debug_log:
+        if ev["kind"] == "morph":
+            best_iou = max((iou for (_a, iou, _ar) in ev["raw"]), default=0.0)
+            morph_ious.append(best_iou)
+    if morph_ious:
+        morph_ious = np.array(morph_ious)
+        print(f"morph_reject best-IoU-seen distribution: n={len(morph_ious)} "
+              f"mean={morph_ious.mean():.3f} median={np.median(morph_ious):.3f} "
+              f"min={morph_ious.min():.3f} max={morph_ious.max():.3f} "
+              f"(all are just below min_iou={env.min_iou} by definition of this bucket "
+              f"unless area check was the actual blocker)")
+        # how many would flip to accepted at a few candidate lower thresholds
+        for thresh in (0.45, 0.40, 0.35, 0.30):
+            n_would_pass = int((morph_ious >= thresh).sum())
+            print(f"  if min_iou were {thresh}: {n_would_pass}/{len(morph_ious)} of these "
+                  f"morph-rejects would have passed on their best candidate frame")
+    jump_events = [ev for ev in env._debug_log if ev["kind"] == "jump"]
+    if jump_events:
+        jd = np.array([ev["jump_deg"] for ev in jump_events])
+        print(f"jump_reject jump_deg distribution: n={len(jd)} mean={jd.mean():.1f} "
+              f"median={np.median(jd):.1f} min={jd.min():.1f} max={jd.max():.1f}")
+
+    import json
+    debug_path = out_dir / "debug_log.json"
+    with open(debug_path, "w") as f:
+        json.dump([
+            {**{k: v for k, v in ev.items() if k != "raw"},
+             "raw": [[a, iou, area] for (a, iou, area) in ev["raw"]]}
+            for ev in env._debug_log
+        ], f, indent=1)
+    print(f"Full per-rejection debug log: {debug_path}")
 
     for b in range(B):
         vid = []

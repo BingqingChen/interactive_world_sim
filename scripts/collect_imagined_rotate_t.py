@@ -74,16 +74,23 @@ def red_mask(img):
     return (r > 140) & (g < 110) & (b < 110) & (r - np.maximum(g, b) > 40)
 
 
-def make_templates(frame0):
-    """Rotate frame-0's (upright) T mask over the THETAS grid about its centroid."""
+def make_templates(frame0, thetas=None):
+    """Rotate frame-0's (upright) T mask over `thetas` (default: module THETAS) about
+    its centroid. `thetas=None` keeps existing callers (find_terminal_frame's -130..40
+    deg collection-time grid) untouched; pass a wider grid for callers that need to
+    represent rotations outside that range (e.g. RL exploration, which can drive the T
+    well past the +-80 deg target -- see world_model_iws_rotate_t_env.py, which found
+    the narrow grid saturating at its -130 deg edge and misreporting large false
+    "jumps" for genuine continued rotation the grid simply couldn't represent)."""
     import cv2
+    th_grid = THETAS if thetas is None else thetas
     m0 = red_mask(frame0).astype(np.uint8)
     ys, xs = np.nonzero(m0)
     cy, cx = ys.mean(), xs.mean()
     tpl = np.stack([
         cv2.warpAffine(m0, cv2.getRotationMatrix2D((cx, cy), np.degrees(th), 1.0),
                        (m0.shape[1], m0.shape[0])) > 0
-        for th in THETAS
+        for th in th_grid
     ])  # (n_theta, H, W) bool
     return tpl, (cy, cx)
 
@@ -105,16 +112,18 @@ def est_angle(img, templates, tc):
     return float(THETAS[np.argmax(inter / np.maximum(union, 1))])
 
 
-def est_angle_with_conf(img, templates, tc):
+def est_angle_with_conf(img, templates, tc, thetas=None):
     """Like est_angle, but also returns the best-match IoU (confidence) and the raw
     mask pixel count, for callers that need to reject low-confidence / degenerate
     reads rather than just "no T visible at all" (mask.sum() < 30). Used by the RLPD
     world-model env's hardened reward readout (see rlinf_integration/); est_angle
     itself is left untouched so existing callers (find_terminal_frame, eval_wm_quality)
-    are unaffected.
+    are unaffected. `thetas` MUST be the same grid `templates` was built from
+    (make_templates(..., thetas=...)) -- default None uses the module THETAS.
 
     Returns (angle_rad_or_None, best_iou, mask_pixel_count)."""
     import cv2
+    th_grid = THETAS if thetas is None else thetas
     m = red_mask(img)
     area = int(m.sum())
     if area < 30:
@@ -129,7 +138,7 @@ def est_angle_with_conf(img, templates, tc):
     union = (templates | m_al).sum(axis=(1, 2))
     iou = inter / np.maximum(union, 1)
     best = int(np.argmax(iou))
-    return float(THETAS[best]), float(iou[best]), area
+    return float(th_grid[best]), float(iou[best]), area
 
 
 def find_terminal_frame(ep_imgs, templates, tc, stride=4):

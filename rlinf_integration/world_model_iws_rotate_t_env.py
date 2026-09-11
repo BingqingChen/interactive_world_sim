@@ -74,6 +74,14 @@ from collect_imagined_rotate_t import (  # noqa: E402
 
 N_OBS = 2  # matches n_obs_steps=2 project-wide (diffusion_unet_hybrid_rotate_t.yaml)
 
+# Wider than collect_imagined_rotate_t.py's shared THETAS (-130..40 deg, tuned for
+# DP-driven collection rollouts that stay near the task's target range). RL
+# exploration routinely drives the T past that -- confirmed directly: a smooth_walk
+# diagnostic run produced 6 spurious "jump" events, ALL landing at exactly -130.0 deg
+# (5/6) or within 3.5 deg of it, i.e. the grid boundary, not a real WM discontinuity.
+# Full 360 deg coverage so genuine continued rotation is always representable.
+REWARD_THETAS = np.radians(np.arange(-180, 180, 1.5))
+
 
 class IWSRotateTWorldEnv(BaseWorldEnv):
     def __init__(
@@ -115,11 +123,29 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.n_act = int(cfg.get("n_action_steps", 8))
         self.wm_max_chunks = int(cfg.get("wm_max_chunks", 40))
         self.jump_reject_deg = float(cfg.get("jump_reject_deg", 47.5))
-        # Hard floor on est_angle_with_conf's best-match IoU -- grounded empirically at
-        # 0.5 (real frames never scored below 0.78 in a 24-episode sample; ~6% of WM
-        # frames scored below 0.5, i.e. genuinely deformed, not just noisy). See
-        # _robust_angle_end for the full rationale.
-        self.min_iou = float(cfg.get("min_iou", 0.5))
+        # Hard floor on est_angle_with_conf's best-match IoU. REVISED from an initial
+        # 0.5 down to 0.35 after direct evidence it was rejecting legitimate frames:
+        # a smooth_walk diagnostic run's morph-rejects clustered at IoU 0.34-0.50
+        # (mean 0.42, n=34) -- visually inspected several of the actual rejected
+        # frames (see plan doc) and they show a correctly-shaped, correctly-rotated T
+        # normally gripped by the bimanual arms, NOT a deformed blob. The gripper
+        # mechanism overlaps part of the T's silhouette in essentially every frame of
+        # this task (real or imagined), which lowers raw pixel-mask IoU against a
+        # rigid unoccluded template regardless of whether the underlying shape is
+        # correct -- the original 0.5 floor, calibrated only from aggregate real-vs-WM
+        # IoU statistics (not from looking at what specific frames near the boundary
+        # actually show), didn't account for this. 0.35 still clears the genuinely
+        # degenerate tail from that same calibration (WM frames as low as IoU=0.13).
+        self.min_iou = float(cfg.get("min_iou", 0.35))
+        # After this many CONSECUTIVE rejected chunks for a row, force-accept the best
+        # available area+IoU-passing candidate even if it fails the jump check --
+        # otherwise a single stale `prev` (e.g. from a transient misread) can poison
+        # the reward for the rest of the episode: every subsequent read also looks
+        # "far from prev" and gets jump-rejected too, since prev is never updated on
+        # reject. Confirmed this actually happened: before the wider REWARD_THETAS fix
+        # (see module docstring), one row's episode got permanently stuck this way
+        # after its first grid-boundary misread.
+        self.stuck_reject_limit = int(cfg.get("stuck_reject_limit", 3))
         self.terminal_deg = float(cfg.get("terminal_deg", TERMINAL_DEG))
         self.dec_infer_steps = int(cfg.get("dec_infer_steps", 2))
         x_range = tuple(cfg.get("x_range", (-0.06, 0.06)))
@@ -210,20 +236,25 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.t = 0
         self.steps = 0
 
-        # per-row template library (each row's own upright frame0 anchors its estimator)
+        # per-row template library (each row's own upright frame0 anchors its estimator).
+        # thetas=REWARD_THETAS: full 360 deg grid, wider than the shared module default
+        # -- see REWARD_THETAS's docstring for why (RL exploration drives the T past
+        # the narrower collection-time grid's -130 deg edge).
         self._templates, self._tc, self._frame0_area = [], [], []
         for b in range(B):
-            tpl, tc = make_templates(frame0_u8[b])
+            tpl, tc = make_templates(frame0_u8[b], thetas=REWARD_THETAS)
             self._templates.append(tpl)
             self._tc.append(tc)
             from collect_imagined_rotate_t import red_mask
             self._frame0_area.append(int(red_mask(frame0_u8[b]).sum()))
 
         self.angle_prev = torch.zeros(B, dtype=torch.float32)  # upright init => angle 0
+        self._consec_reject = np.zeros(B, dtype=np.int64)  # for the stuck-prev recovery (see stuck_reject_limit)
         self.frame0_u8 = frame0_u8
         self._jump_reject_count = getattr(self, "_jump_reject_count", 0)
         self._lost_track_count = getattr(self, "_lost_track_count", 0)  # no mask / area sanity fail on every candidate frame
         self._morph_reject_count = getattr(self, "_morph_reject_count", 0)  # mask present & right-sized, but IoU below floor on every candidate frame
+        self._stuck_recovery_count = getattr(self, "_stuck_recovery_count", 0)  # times the stuck-prev escape hatch fired
 
         self._reset_metrics()
         self._is_start = False
@@ -248,10 +279,12 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         f0_area = self._frame0_area[row]
         prev = float(self.angle_prev[row])
 
+        raw = []  # (angle_or_None, iou, area) for ALL 3 frames, unfiltered -- for diagnostics
         reads = []  # (angle, iou) for frames that pass BOTH sanity checks
         any_mask_ok = False  # at least one frame had a plausible-area mask (area check passed)
         for frame in dec_u8_last3:
-            angle, iou, area = est_angle_with_conf(frame, templates, tc)
+            angle, iou, area = est_angle_with_conf(frame, templates, tc, thetas=REWARD_THETAS)
+            raw.append((angle, iou, area))
             if angle is None:
                 continue
             # area sanity: reject if the mask ballooned/collapsed vs frame 0's own area
@@ -260,16 +293,13 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
             if area < 0.3 * f0_area or area > 3.0 * f0_area:
                 continue
             any_mask_ok = True
-            # HARD IoU floor -- catches "T morphed into some other shape" (roughly
-            # T-sized so the area check alone misses it, but no rigid rotation of the
-            # template explains it well). Grounded empirically: across a 24-episode
-            # real-vs-imagined paired sample, REAL frames never scored below IoU=0.78
-            # (min over 4800 frames) against their own best-fit rotation, while ~6% of
-            # WM frames scored below 0.5 (worst 0.13) -- a clear separation. Below this
-            # floor the read is dropped entirely, NOT just down-weighted: previously
-            # min_iou only fed the confidence-weighted median as a soft weight, so a
-            # single badly-deformed read with e.g. iou=0.15 still got normalized weight
-            # 1.0 and was fully trusted when it was the only candidate in the window.
+            # HARD IoU floor. See min_iou's definition (_build_dataset) for why this is
+            # 0.35, not the originally-planned 0.5 -- direct inspection of rejected
+            # frames in that 0.34-0.50 band showed legitimate, correctly-rotated T's
+            # partly occluded by the gripper mechanism (present in every frame of this
+            # task), not deformed shapes. Read is dropped entirely below the floor, not
+            # just down-weighted, so a single badly-deformed read can't dominate the
+            # median just because it's the only candidate in the window.
             if iou < self.min_iou:
                 continue
             reads.append((angle, iou))
@@ -279,6 +309,12 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                 self._morph_reject_count += 1  # had a plausible mask, but shape didn't match any rotation
             else:
                 self._lost_track_count += 1  # no mask at all, or wildly wrong area
+            self._consec_reject[row] += 1
+            if hasattr(self, "_debug_log") and self._debug_log is not None:
+                self._debug_log.append(dict(
+                    row=row, kind=("morph" if any_mask_ok else "lost"),
+                    raw=raw, f0_area=f0_area, prev_deg=np.degrees(prev),
+                ))
             return prev, False  # carry forward, not accepted (prog=0 for this chunk)
 
         # confidence-weighted median: sort by angle, pick the read whose cumulative
@@ -292,11 +328,36 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         idx = min(idx, len(reads) - 1)
         candidate = reads[idx][0]
 
-        jump_deg = abs(np.degrees(candidate - prev))
+        # Wraparound-safe angular distance -- REWARD_THETAS now spans the full circle
+        # (see its docstring), so a naive difference would misreport e.g. -179 -> +179
+        # deg (a genuine 2 deg step) as a spurious ~358 deg jump.
+        jump_deg = abs(((np.degrees(candidate - prev) + 180) % 360) - 180)
         if jump_deg > self.jump_reject_deg:
+            self._consec_reject[row] += 1
+            # Stuck-prev recovery: don't let one stale `prev` (e.g. a transient
+            # misread) poison the reward for the rest of the episode by making every
+            # subsequent read "far from prev" too. We HAVE a plausible candidate here
+            # (reads is non-empty) -- after enough consecutive rejects, trust it.
+            if self._consec_reject[row] >= self.stuck_reject_limit:
+                self._stuck_recovery_count += 1
+                self._consec_reject[row] = 0
+                if hasattr(self, "_debug_log") and self._debug_log is not None:
+                    self._debug_log.append(dict(
+                        row=row, kind="stuck_recovery", raw=raw, f0_area=f0_area,
+                        prev_deg=np.degrees(prev), candidate_deg=np.degrees(candidate),
+                        jump_deg=jump_deg,
+                    ))
+                return candidate, True
             self._jump_reject_count += 1
+            if hasattr(self, "_debug_log") and self._debug_log is not None:
+                self._debug_log.append(dict(
+                    row=row, kind="jump", raw=raw, f0_area=f0_area,
+                    prev_deg=np.degrees(prev), candidate_deg=np.degrees(candidate),
+                    jump_deg=jump_deg,
+                ))
             return prev, False
 
+        self._consec_reject[row] = 0
         return candidate, True
 
     # -------------------------------------------------------------- chunk_step
@@ -379,6 +440,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         infos["jump_reject_count"] = self._jump_reject_count
         infos["lost_track_count"] = self._lost_track_count
         infos["morph_reject_count"] = self._morph_reject_count
+        infos["stuck_recovery_count"] = self._stuck_recovery_count
 
         return (
             [extracted_obs],
