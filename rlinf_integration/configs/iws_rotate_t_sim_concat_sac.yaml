@@ -1,0 +1,166 @@
+# RLPD-recipe validation, condition 1 (WM-only analog): SAC in the REAL simulator
+# (ground-truth angle+flatness reward, IWSRotateTSimEnv) with an EMPTY demo_buffer --
+# i.e. vanilla online SAC, RLPD's "R=0" analog. Identical to
+# iws_rotate_t_sim_single_sac.yaml except state_history="concat_state": states is
+# the concatenation of the previous+current EE-xy (state_dim=8, velocity-like info
+# folded in), run side-by-side on the second GPU rather than deciding a priori
+# whether single-frame state suffices. See that file's header for full rationale.
+defaults:
+  - env/iws_rotate_t_sim_concat@env.train
+  - env/iws_rotate_t_sim_concat@env.eval
+  - model/cnn_policy@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,actor,rollout: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "iws_rotate_t_sim_concat_sac_r0"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 3000
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: 100
+  save_interval: 200
+
+algorithm:
+  update_epoch: 4
+  group_size: 1
+  agg_q: min
+  actor_agg_q: min
+  backup_entropy: True
+  critic_subsample_size: 2
+  enable_drq: False
+
+  reward_type: action_level
+  logprob_type: action_level
+  entropy_type: action_level
+
+  adv_type: embodied_sac
+  loss_type: embodied_sac
+  loss_agg_func: "token-mean"
+
+  bootstrap_type: standard
+  gamma: 0.96
+  tau: 0.005
+
+  entropy_tuning:
+    alpha_type: softplus
+    initial_alpha: 0.2
+    target_entropy: -4
+    optim:
+      lr: 3.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  critic_actor_ratio: 4
+
+  replay_buffer:
+    enable_cache: True
+    cache_size: 5000
+    sample_window_size: 5000
+    min_buffer_size: 4
+    auto_save: False
+
+  num_updates_per_step: 32
+  target_update_freq: 1
+
+env:
+  group_name: "EnvGroup"
+
+  train:
+    rollout_epoch: 1
+    total_num_envs: 8
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/train
+
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 4
+    max_steps_per_rollout_epoch: 20   # chunk_step calls per eval env, enough to let most episodes finish (max_episode_steps=100)
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+
+  collect_transitions: True
+  collect_prev_infos: False
+
+  model:
+    model_path: "/home/jacobhb/projects/intern_project/RLinf/RLinf-ResNet10-pretrained"
+    state_dim: 8
+    action_dim: 4
+    num_action_chunks: 1  # must match actor.model.num_action_chunks -- see that field's comment
+    num_q_heads: 10
+    precision: ${actor.model.precision}
+
+  enable_torch_compile: True
+  enable_cuda_graph: False
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+
+  micro_batch_size: 128
+  global_batch_size: 128
+  seed: 42
+  enable_offload: False
+
+  model:
+    model_path: "/home/jacobhb/projects/intern_project/RLinf/RLinf-ResNet10-pretrained"
+    state_dim: 8
+    action_dim: 4
+    # num_action_chunks=1 -- see iws_rotate_t_sim_single_sac.yaml's comment on the
+    # same field: CNNPolicy is architecturally single-action-per-call (confirmed
+    # by a real crash at num_action_chunks=8), reward granularity is preserved
+    # via action-repeat inside real_sim_chunk_server.py instead.
+    num_action_chunks: 1
+    num_q_heads: 10
+
+  optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  critic_optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

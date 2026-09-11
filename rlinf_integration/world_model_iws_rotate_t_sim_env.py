@@ -72,11 +72,15 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         self.state_history = cfg.get("state_history", "single")
         assert self.state_history in ("single", "concat_state")
 
-        server_script = Path(__file__).parent / "real_sim_chunk_server.py"
+        # .resolve() is required: this module is loaded via a symlink into
+        # ~/RLinf/rlinf/envs/world_model/, and __file__ reports the symlink's own
+        # path -- Path(__file__).parent without resolving would point at the RLinf
+        # dir (where real_sim_chunk_server.py doesn't exist), not this worktree.
+        server_script = Path(__file__).resolve().parent / "real_sim_chunk_server.py"
         self._sim_proc = subprocess.Popen(
             [IWS_VENV_PYTHON, "-u", str(server_script),
              "--num_envs", str(self.num_envs), "--max_steps", str(max_steps),
-             "--n_obs", str(n_obs),
+             "--n_obs", str(n_obs), "--action_repeat", str(self.n_act),
              "--x_min", str(x_range[0]), "--x_max", str(x_range[1]),
              "--y_min", str(y_range[0]), "--y_max", str(y_range[1]),
              "--feasible_mask", str(feasible_mask_path),
@@ -158,14 +162,32 @@ class IWSRotateTSimEnv(BaseWorldEnv):
 
     # -------------------------------------------------------------- chunk_step
     def chunk_step(self, actions):
-        """actions: (B, n_act, 4) raw EE-xy targets. Returns the same 5-tuple
-        contract as IWSRotateTWorldEnv.chunk_step (verified against env_worker.py's
-        actual consumption, not the BaseWorldEnv abstract docstring -- see that
-        env's docstring for the discrepancy)."""
+        """actions: (B, 1, 4) raw EE-xy target -- ONE action per call, not an
+        8-long DP-style chunk. Corrected after a real smoke-test crash:
+        CNNPolicy._generate_actions reshapes its action head's raw output to
+        (-1, num_action_chunks, action_dim) with NO widening for
+        num_action_chunks>1 (the head's output size is fixed at action_dim
+        regardless), so num_action_chunks must be 1 for this policy family --
+        confirmed by the crash ("shape '[-1, 8, 4]' is invalid for input of size
+        16" when num_action_chunks was set to 8). RLinf therefore calls
+        chunk_step once per SINGLE raw action, not once per 8-step DP chunk as
+        originally designed.
+
+        To preserve the validated reward granularity anyway (AlohaChunkEnv's
+        dense progress reward is computed once per 8 raw physics sub-steps,
+        matching this project's n_action_steps=8 DP convention), this env uses
+        **action repeat**: the actor's one EE-xy target is held constant and
+        fed to AlohaChunkEnv.step_chunk as an 8-long repeated chunk, entirely
+        inside real_sim_chunk_server.py (see its --action_repeat arg) -- a
+        standard RL temporal-abstraction pattern, invisible to RLinf as a
+        multi-width tensor. Returns the same 5-tuple contract as
+        IWSRotateTWorldEnv.chunk_step, but now with width 1 (=
+        actor.model.num_action_chunks) along the chunk axis, not width n_act."""
         if isinstance(actions, torch.Tensor):
             actions_np = actions.detach().cpu().numpy().astype(np.float32)
         else:
             actions_np = np.asarray(actions, dtype=np.float32)
+        actions_np = actions_np[:, 0]  # (B, 1, 4) -> (B, 4): the single action this call carries
 
         imgs, aps, rewards, terminations, truncations, successes = self._send(b"\x02", actions_np)
         obs = self._wrap_obs(imgs, aps)
@@ -174,13 +196,12 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         term_t = torch.from_numpy(terminations).to(device)
         trunc_t = torch.from_numpy(truncations).to(device)
 
-        B, n_act = self.num_envs, self.n_act
-        chunk_rewards = torch.zeros(B, n_act, dtype=torch.float32, device=device)
-        chunk_rewards[:, -1] = rewards_t
-        chunk_terminations = torch.zeros(B, n_act, dtype=torch.bool, device=device)
-        chunk_terminations[:, -1] = term_t
-        chunk_truncations = torch.zeros(B, n_act, dtype=torch.bool, device=device)
-        chunk_truncations[:, -1] = trunc_t
+        # Width 1 along the chunk axis, matching actor.model.num_action_chunks=1
+        # (see chunk_step's docstring) -- NOT self.n_act (the internal 8-step
+        # action-repeat count, which never leaves real_sim_chunk_server.py).
+        chunk_rewards = rewards_t.unsqueeze(-1)
+        chunk_terminations = term_t.unsqueeze(-1)
+        chunk_truncations = trunc_t.unsqueeze(-1)
 
         infos = self._record_metrics(rewards_t, term_t, {})
         infos["success"] = successes

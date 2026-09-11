@@ -178,7 +178,11 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.wm = M.load_model(wm_ckpt, vcfg.algorithm, self._get_runtime_device_str())
         self.wm.dec_infer_steps = self.dec_infer_steps
 
-        server_script = Path(__file__).parent / "real_reset_server.py"
+        # .resolve() is required: this module is loaded via a symlink into
+        # ~/RLinf/rlinf/envs/world_model/, and __file__ reports the symlink's own
+        # path -- Path(__file__).parent without resolving would point at the RLinf
+        # dir (where real_reset_server.py doesn't exist), not this worktree.
+        server_script = Path(__file__).resolve().parent / "real_reset_server.py"
         self._reset_proc = subprocess.Popen(
             [IWS_VENV_PYTHON, "-u", str(server_script),
              "--x_min", str(x_range[0]), "--x_max", str(x_range[1]),
