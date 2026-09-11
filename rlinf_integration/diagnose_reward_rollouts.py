@@ -79,7 +79,22 @@ def main():
     ap.add_argument("--seed_base", type=int, default=850_000)  # disjoint from prior collection/eval seeds
     ap.add_argument("--action_seed", type=int, default=0)
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--action_mode", choices=["iid_uniform", "smooth_walk"], default="smooth_walk",
+                    help="iid_uniform: i.i.d. uniform over the WM normalizer's full fitted "
+                         "range (worst-case OOD stress test, the original diagnostic). "
+                         "smooth_walk: a Gaussian random walk in chunk-target space, step "
+                         "size = the REAL per-chunk action-delta std measured from "
+                         "datasets/scaling_v3/real/{A,B,C,D}.zarr, with within-chunk linear "
+                         "interpolation -- approximates what an early (still mostly random "
+                         "but temporally-smooth) SAC/RLPD Gaussian policy would actually emit, "
+                         "rather than i.i.d. jumps to random extremes every chunk.")
     args = ap.parse_args()
+
+    # Empirically measured (not guessed) from real trajectories: interactive_world_sim
+    # scripts/analysis, see plan doc. Per-dim per-STEP delta std; the per-chunk (8-step)
+    # step size used below is this * sqrt(8), i.e. real chunk-to-chunk target variability.
+    REAL_STEP_DELTA_STD = np.array([0.00443962, 0.00653751, 0.00439547, 0.00649021], dtype=np.float32)
+    REAL_CHUNK_DELTA_STD = REAL_STEP_DELTA_STD * np.sqrt(8)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -91,20 +106,34 @@ def main():
     # trajectory just because another row in the batch finished first.
     env.reset = lambda *a, **k: (env._wrap_obs(), {})
 
-    # Random actions within the WM's own fitted action-normalizer range -- the most
-    # representative "arbitrary but plausible-scale" distribution to stress-test with,
-    # and exactly the kind of action an untrained/early-training RLPD actor would emit.
     stats = env.wm.normalizer["action"].get_input_stats()
     a_min = stats["min"].detach().cpu().numpy().reshape(-1)
     a_max = stats["max"].detach().cpu().numpy().reshape(-1)
     print(f"action range from WM normalizer: min={a_min} max={a_max}", flush=True)
+    print(f"action_mode={args.action_mode}"
+          + (f"  chunk_delta_std={REAL_CHUNK_DELTA_STD}" if args.action_mode == "smooth_walk" else ""),
+          flush=True)
     rng = np.random.default_rng(args.action_seed)
 
     B, n_act, wm_max_chunks = env.num_envs, env.n_act, env.wm_max_chunks
     frames_log = [[] for _ in range(B)]  # per-row list of (frame_u8, angle_deg, reward, accepted, reject_reason)
 
+    # smooth_walk state: per-row current chunk-target, initialized at each row's real
+    # starting EE-xy (env.curr_state right after reset == home_xy).
+    walk_target = env.curr_state.detach().cpu().numpy().copy() if args.action_mode == "smooth_walk" else None
+
     for step in range(wm_max_chunks):
-        actions = rng.uniform(a_min, a_max, size=(B, n_act, 4)).astype(np.float32)
+        if args.action_mode == "iid_uniform":
+            actions = rng.uniform(a_min, a_max, size=(B, n_act, 4)).astype(np.float32)
+        else:
+            prev_target = walk_target.copy()
+            step_noise = rng.normal(0.0, REAL_CHUNK_DELTA_STD, size=(B, 4)).astype(np.float32)
+            walk_target = np.clip(prev_target + step_noise, a_min, a_max)
+            # linear interpolation across the 8 sub-steps -- no sub-step teleports,
+            # matching how a real chunk-level action head outputs a smooth trajectory.
+            alphas = np.linspace(1.0 / n_act, 1.0, n_act, dtype=np.float32)  # (n_act,)
+            actions = (prev_target[:, None, :] +
+                      alphas[None, :, None] * (walk_target - prev_target)[:, None, :]).astype(np.float32)
         prev_lost, prev_morph, prev_jump = env._lost_track_count, env._morph_reject_count, env._jump_reject_count
         obs_list, rewards, terms, truncs, infos_list = env.chunk_step(torch.from_numpy(actions))
         # per-row bookkeeping: pull the last decoded frame + this chunk's angle/reward
