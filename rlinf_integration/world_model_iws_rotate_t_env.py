@@ -100,6 +100,11 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.n_act = int(cfg.get("n_action_steps", 8))
         self.wm_max_chunks = int(cfg.get("wm_max_chunks", 40))
         self.jump_reject_deg = float(cfg.get("jump_reject_deg", 47.5))
+        # Hard floor on est_angle_with_conf's best-match IoU -- grounded empirically at
+        # 0.5 (real frames never scored below 0.78 in a 24-episode sample; ~6% of WM
+        # frames scored below 0.5, i.e. genuinely deformed, not just noisy). See
+        # _robust_angle_end for the full rationale.
+        self.min_iou = float(cfg.get("min_iou", 0.5))
         self.terminal_deg = float(cfg.get("terminal_deg", TERMINAL_DEG))
         self.dec_infer_steps = int(cfg.get("dec_infer_steps", 2))
         x_range = tuple(cfg.get("x_range", (-0.06, 0.06)))
@@ -205,7 +210,8 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.angle_prev = torch.zeros(B, dtype=torch.float32)  # upright init => angle 0
         self.frame0_u8 = frame0_u8
         self._jump_reject_count = getattr(self, "_jump_reject_count", 0)
-        self._lost_track_count = getattr(self, "_lost_track_count", 0)
+        self._lost_track_count = getattr(self, "_lost_track_count", 0)  # no mask / area sanity fail on every candidate frame
+        self._morph_reject_count = getattr(self, "_morph_reject_count", 0)  # mask present & right-sized, but IoU below floor on every candidate frame
 
         self._reset_metrics()
         self._is_start = False
@@ -230,7 +236,8 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         f0_area = self._frame0_area[row]
         prev = float(self.angle_prev[row])
 
-        reads = []  # (angle, iou) for frames that pass the area sanity check
+        reads = []  # (angle, iou) for frames that pass BOTH sanity checks
+        any_mask_ok = False  # at least one frame had a plausible-area mask (area check passed)
         for frame in dec_u8_last3:
             angle, iou, area = est_angle_with_conf(frame, templates, tc)
             if angle is None:
@@ -240,10 +247,26 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
             # under pure rotation; a big deviation flags occlusion/color hallucination)
             if area < 0.3 * f0_area or area > 3.0 * f0_area:
                 continue
+            any_mask_ok = True
+            # HARD IoU floor -- catches "T morphed into some other shape" (roughly
+            # T-sized so the area check alone misses it, but no rigid rotation of the
+            # template explains it well). Grounded empirically: across a 24-episode
+            # real-vs-imagined paired sample, REAL frames never scored below IoU=0.78
+            # (min over 4800 frames) against their own best-fit rotation, while ~6% of
+            # WM frames scored below 0.5 (worst 0.13) -- a clear separation. Below this
+            # floor the read is dropped entirely, NOT just down-weighted: previously
+            # min_iou only fed the confidence-weighted median as a soft weight, so a
+            # single badly-deformed read with e.g. iou=0.15 still got normalized weight
+            # 1.0 and was fully trusted when it was the only candidate in the window.
+            if iou < self.min_iou:
+                continue
             reads.append((angle, iou))
 
         if not reads:
-            self._lost_track_count += 1
+            if any_mask_ok:
+                self._morph_reject_count += 1  # had a plausible mask, but shape didn't match any rotation
+            else:
+                self._lost_track_count += 1  # no mask at all, or wildly wrong area
             return prev, False  # carry forward, not accepted (prog=0 for this chunk)
 
         # confidence-weighted median: sort by angle, pick the read whose cumulative
@@ -343,6 +366,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         infos = self._record_metrics(rewards_last, terminations_last, infos)
         infos["jump_reject_count"] = self._jump_reject_count
         infos["lost_track_count"] = self._lost_track_count
+        infos["morph_reject_count"] = self._morph_reject_count
 
         return (
             [extracted_obs],
