@@ -80,7 +80,7 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         self._sim_proc = subprocess.Popen(
             [IWS_VENV_PYTHON, "-u", str(server_script),
              "--num_envs", str(self.num_envs), "--max_steps", str(max_steps),
-             "--n_obs", str(n_obs), "--action_repeat", str(self.n_act),
+             "--n_obs", str(n_obs),
              "--x_min", str(x_range[0]), "--x_max", str(x_range[1]),
              "--y_min", str(y_range[0]), "--y_max", str(y_range[1]),
              "--feasible_mask", str(feasible_mask_path),
@@ -162,32 +162,36 @@ class IWSRotateTSimEnv(BaseWorldEnv):
 
     # -------------------------------------------------------------- chunk_step
     def chunk_step(self, actions):
-        """actions: (B, 1, 4) raw EE-xy target -- ONE action per call, not an
-        8-long DP-style chunk. Corrected after a real smoke-test crash:
-        CNNPolicy._generate_actions reshapes its action head's raw output to
-        (-1, num_action_chunks, action_dim) with NO widening for
-        num_action_chunks>1 (the head's output size is fixed at action_dim
-        regardless), so num_action_chunks must be 1 for this policy family --
-        confirmed by the crash ("shape '[-1, 8, 4]' is invalid for input of size
-        16" when num_action_chunks was set to 8). RLinf therefore calls
-        chunk_step once per SINGLE raw action, not once per 8-step DP chunk as
-        originally designed.
+        """actions: (B, 1, 32) -- CNNPolicy emits exactly ONE vector per forward
+        call regardless of num_action_chunks (confirmed by a real crash trying
+        num_action_chunks=8: its action head is Linear(hidden_dim, action_dim)
+        with no widening). Rather than repeating a single action (which the
+        WM was never trained on -- imagine_batch's dynamics_forward always
+        consumes 8 genuinely distinct waypoints per call, so action-repeat is
+        actually out-of-distribution), this env instead sets
+        actor.model.action_dim = 4 * n_action_steps = 32 in the config, so the
+        SAME unmodified CNNPolicy head naturally emits 8 waypoints' worth of
+        values in one flat vector -- confirmed clean by reading the model code:
+        the action head, Q-network, actor_logstd, and action_scale/bias are all
+        generic in self.cfg.action_dim (cnn_policy.py:132,149,156,159,163-166),
+        and action_scale is a single (lo,hi) pair broadcast uniformly across
+        all 32 dims -- correct here since all 32 are the same physical
+        quantity (EE-xy) repeated across the chunk, not heterogeneous joints.
+        This env reshapes that flat (B,32) into a genuine (B,8,4) waypoint
+        chunk and sends the WHOLE chunk to AlohaChunkEnv.step_chunk, exactly
+        matching imagine_batch's own DP-chunk convention and the reward
+        AlohaChunkEnv was actually validated against -- no action-repeat, no
+        RLinf model-code changes.
 
-        To preserve the validated reward granularity anyway (AlohaChunkEnv's
-        dense progress reward is computed once per 8 raw physics sub-steps,
-        matching this project's n_action_steps=8 DP convention), this env uses
-        **action repeat**: the actor's one EE-xy target is held constant and
-        fed to AlohaChunkEnv.step_chunk as an 8-long repeated chunk, entirely
-        inside real_sim_chunk_server.py (see its --action_repeat arg) -- a
-        standard RL temporal-abstraction pattern, invisible to RLinf as a
-        multi-width tensor. Returns the same 5-tuple contract as
-        IWSRotateTWorldEnv.chunk_step, but now with width 1 (=
-        actor.model.num_action_chunks) along the chunk axis, not width n_act."""
+        Returns the same 5-tuple contract as IWSRotateTWorldEnv.chunk_step,
+        width 1 along the chunk axis (= actor.model.num_action_chunks, which
+        stays 1 -- only action_dim widened, not num_action_chunks)."""
         if isinstance(actions, torch.Tensor):
             actions_np = actions.detach().cpu().numpy().astype(np.float32)
         else:
             actions_np = np.asarray(actions, dtype=np.float32)
-        actions_np = actions_np[:, 0]  # (B, 1, 4) -> (B, 4): the single action this call carries
+        B = actions_np.shape[0]
+        actions_np = actions_np.reshape(B, self.n_act, 4)  # (B,1,32) -> (B,8,4) genuine waypoint chunk
 
         imgs, aps, rewards, terminations, truncations, successes = self._send(b"\x02", actions_np)
         obs = self._wrap_obs(imgs, aps)

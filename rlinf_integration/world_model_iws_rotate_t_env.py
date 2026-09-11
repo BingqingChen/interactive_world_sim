@@ -402,7 +402,13 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
     # -------------------------------------------------------------- chunk_step
     @torch.no_grad()
     def chunk_step(self, actions):
-        """actions: (B, n_act, 4) raw EE-xy targets, already prepared by
+        """actions arrive as (B, 1, 4*n_act) -- CNNPolicy emits exactly one flat
+        vector per forward call (num_action_chunks stays 1), so
+        actor.model.action_dim is set to 4*n_action_steps in the config and
+        reshaped here into a genuine (B, n_act, 4) waypoint chunk, matching
+        imagine_batch's own DP-chunk convention exactly (a real per-call
+        `policy.predict_action(obs_dict)["action"]` is (B,n_act,4) too -- see
+        collect_imagined_rotate_t.py's imagine_batch). Already prepared by
         rlinf.envs.action_utils.prepare_actions (pass-through for this env type --
         see rlinf_integration/ACTION_UTILS_PATCH.md).
 
@@ -414,7 +420,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         B, device, n_act = self.num_envs, self.device, self.n_act
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions, dtype=torch.float32)
-        actions = actions.detach().to("cpu", dtype=torch.float32)  # (B, n_act, 4)
+        actions = actions.detach().to("cpu", dtype=torch.float32).reshape(B, n_act, 4)
 
         t = self.t
         self.exec_actions_hist[:, t : t + n_act] = actions

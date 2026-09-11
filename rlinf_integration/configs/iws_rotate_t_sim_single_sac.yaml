@@ -75,7 +75,7 @@ algorithm:
   entropy_tuning:
     alpha_type: softplus
     initial_alpha: 0.2
-    target_entropy: -4   # -action_dim
+    target_entropy: -32   # RLinf's own default is -actor.model.action_dim (fsdp_sac_policy_worker.py:145); action_dim=32=4*n_action_steps here (see actor.model.action_dim comment), so this scales with it, not with the real 4-D EE-xy
     optim:
       lr: 3.0e-4
       lr_scheduler: torch_constant
@@ -129,8 +129,8 @@ rollout:
   model:
     model_path: "/home/jacobhb/projects/intern_project/RLinf/RLinf-ResNet10-pretrained"
     state_dim: 4
-    action_dim: 4
-    num_action_chunks: 1  # must match actor.model.num_action_chunks -- see that field's comment
+    action_dim: 32  # must match actor.model.action_dim -- see that field's comment
+    num_action_chunks: 1
     num_q_heads: 10
     precision: ${actor.model.precision}
 
@@ -149,15 +149,24 @@ actor:
   model:
     model_path: "/home/jacobhb/projects/intern_project/RLinf/RLinf-ResNet10-pretrained"
     state_dim: 4
-    action_dim: 4
-    # num_action_chunks=1: CNNPolicy's action head outputs exactly action_dim
-    # values per call regardless of this setting (confirmed by a real crash when
-    # it was tried at 8: "shape '[-1, 8, 4]' is invalid for input of size 16") --
-    # this policy family is architecturally single-action-per-call, like every
-    # other SAC/RLPD CNN precedent in this repo. The env still preserves
-    # AlohaChunkEnv's validated 8-step reward granularity via action-repeat
-    # inside real_sim_chunk_server.py (see IWSRotateTSimEnv.chunk_step's
-    # docstring) -- RLinf itself only ever sees width-1 action chunks here.
+    # CNNPolicy's action head is Linear(hidden_dim, action_dim) and does NOT
+    # widen with num_action_chunks (confirmed by a real crash trying
+    # num_action_chunks=8: "shape '[-1, 8, 4]' is invalid for input of size
+    # 16") -- it emits exactly one flat vector per forward call, like every
+    # other SAC/RLPD CNN precedent in this repo. Rather than repeating a
+    # single action (which the WM was never trained on -- imagine_batch's
+    # dynamics_forward always consumes 8 genuinely distinct waypoints per
+    # call), action_dim is set to 4*n_action_steps=32 here so the SAME
+    # unmodified action head naturally emits a full 8-waypoint chunk's worth
+    # of values in one call; IWSRotateTSimEnv.chunk_step reshapes this flat
+    # (B,32) into a genuine (B,8,4) chunk before sending it to
+    # AlohaChunkEnv.step_chunk -- confirmed clean by reading cnn_policy.py:
+    # the Q-network, actor_logstd, and action_scale/bias (a single (lo,hi)
+    # pair broadcast across all dims) are all generic in action_dim, and
+    # broadcasting one scale across all 32 dims is correct here since they're
+    # all the same physical quantity (EE-xy) repeated across the chunk, not
+    # heterogeneous joints. num_action_chunks stays 1 -- only action_dim widened.
+    action_dim: 32
     num_action_chunks: 1
     num_q_heads: 10
 

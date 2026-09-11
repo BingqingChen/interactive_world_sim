@@ -17,8 +17,12 @@ subtle discrepancy that turned up between the WM env and this precedent (see the
 Protocol (binary, over stdin/stdout pipes):
   request:  client writes 1 byte: 0x01 = reset_all, 0x02 = step_chunk
     step_chunk additionally sends an 8-byte big-endian length header + that many
-    pickled bytes of a (B, 4) float32 SINGLE-action array (one raw EE-xy target
-    per env, not an 8-long DP-style chunk -- see --action_repeat below).
+    pickled bytes of a (B, n_act, 4) float32 GENUINE waypoint-chunk array (n_act
+    distinct EE-xy targets per env, matching AlohaChunkEnv.step_chunk's own
+    n_action_steps=8 convention -- not a single repeated action; see
+    IWSRotateTSimEnv.chunk_step's docstring for how RLinf's CNNPolicy, which
+    only emits one vector per forward call, is made to produce this: setting
+    actor.model.action_dim = 4*n_action_steps and reshaping client-side).
   response: 8-byte big-endian length header + that many pickled bytes of:
     reset_all -> (imgs (B,n_obs,3,128,128) f32 [0,1], aps (B,n_obs,4) f32)
     step_chunk -> (imgs, aps, rewards (B,) f32, terminations (B,) bool,
@@ -29,21 +33,9 @@ Protocol (binary, over stdin/stdout pipes):
     -- real-sim resets are cheap, no reason to force batch-sync semantics here).
   EOF on stdin -> server exits.
 
-**Action repeat** (--action_repeat, default 8): RLinf's CNNPolicy emits exactly
-ONE action per forward call (confirmed via a real crash when
-actor.model.num_action_chunks was set >1: its action head's output size doesn't
-scale with num_action_chunks), so the caller (IWSRotateTSimEnv) now sends one
-(B,4) action per step_chunk call, not an (B,8,4) DP-style chunk. To preserve the
-reward granularity AlohaChunkEnv.step_chunk was actually validated against
-(dense progress computed once per 8 raw physics sub-steps, matching this
-project's n_action_steps=8 DP convention), this server holds each incoming
-single action constant and repeats it --action_repeat times before calling
-e.step_chunk(...) -- a standard action-repeat/temporal-abstraction pattern,
-entirely internal to this server and invisible to RLinf.
-
 Usage (spawned by IWSRotateTSimEnv._build_dataset, not run manually):
   MUJOCO_GL=egl <iws_venv>/bin/python real_sim_chunk_server.py \
-      --num_envs 16 --max_steps 800 --n_obs 2 --action_repeat 8 \
+      --num_envs 16 --max_steps 800 --n_obs 2 \
       --x_min -0.06 --x_max 0.06 --y_min -0.06 --y_max 0.06 \
       --feasible_mask <path> --env_seed_base <int> \
       --iws_scripts_root <path>
@@ -64,7 +56,6 @@ def main():
     ap.add_argument("--num_envs", type=int, required=True)
     ap.add_argument("--max_steps", type=int, default=800, help="RAW env steps, not chunks (matches AlohaChunkEnv's own units)")
     ap.add_argument("--n_obs", type=int, default=2)
-    ap.add_argument("--action_repeat", type=int, default=8, help="raw physics sub-steps to hold each single incoming action for, matching AlohaChunkEnv's n_action_steps-chunk reward granularity")
     ap.add_argument("--x_min", type=float, default=-0.06)
     ap.add_argument("--x_max", type=float, default=0.06)
     ap.add_argument("--y_min", type=float, default=-0.06)
@@ -126,14 +117,10 @@ def main():
                 aps.append(ap_h)
             send((np.stack(imgs), np.stack(aps)))
         elif req == b"\x02":  # step_chunk
-            actions = recv_payload()  # (B, 4) float32 -- one raw action per env
+            actions = recv_payload()  # (B, n_act, 4) float32 -- genuine waypoint chunk per env
             imgs, aps, rewards, terminations, truncations, successes = [], [], [], [], [], []
             for i, e in enumerate(envs):
-                # Action repeat: hold this single target for `action_repeat` raw
-                # physics sub-steps, matching AlohaChunkEnv's own validated
-                # 8-step reward granularity (see module docstring).
-                repeated_chunk = np.repeat(actions[i][None, :], args.action_repeat, axis=0)
-                (img_h, ap_h), rew, done, info = e.step_chunk(repeated_chunk)
+                (img_h, ap_h), rew, done, info = e.step_chunk(actions[i])
                 ok = bool(info["success"])
                 if done:
                     # per-row independent reset, matching AlohaChunkEnv's own usage

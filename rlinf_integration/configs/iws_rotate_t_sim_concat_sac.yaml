@@ -65,7 +65,7 @@ algorithm:
   entropy_tuning:
     alpha_type: softplus
     initial_alpha: 0.2
-    target_entropy: -4
+    target_entropy: -32   # see iws_rotate_t_sim_single_sac.yaml: scales with actor.model.action_dim=32 (4*n_action_steps), not the real 4-D EE-xy
     optim:
       lr: 3.0e-4
       lr_scheduler: torch_constant
@@ -113,8 +113,8 @@ rollout:
   model:
     model_path: "/home/jacobhb/projects/intern_project/RLinf/RLinf-ResNet10-pretrained"
     state_dim: 8
-    action_dim: 4
-    num_action_chunks: 1  # must match actor.model.num_action_chunks -- see that field's comment
+    action_dim: 32  # must match actor.model.action_dim -- see that field's comment
+    num_action_chunks: 1
     num_q_heads: 10
     precision: ${actor.model.precision}
 
@@ -133,11 +133,12 @@ actor:
   model:
     model_path: "/home/jacobhb/projects/intern_project/RLinf/RLinf-ResNet10-pretrained"
     state_dim: 8
-    action_dim: 4
-    # num_action_chunks=1 -- see iws_rotate_t_sim_single_sac.yaml's comment on the
-    # same field: CNNPolicy is architecturally single-action-per-call (confirmed
-    # by a real crash at num_action_chunks=8), reward granularity is preserved
-    # via action-repeat inside real_sim_chunk_server.py instead.
+    # action_dim=32=4*n_action_steps, num_action_chunks stays 1 -- see
+    # iws_rotate_t_sim_single_sac.yaml's comment on the same fields: CNNPolicy
+    # emits one flat vector per call, so widening action_dim (not
+    # num_action_chunks) is what makes it emit a genuine 8-waypoint chunk in
+    # one shot, reshaped client-side in IWSRotateTSimEnv.chunk_step.
+    action_dim: 32
     num_action_chunks: 1
     num_q_heads: 10
 
