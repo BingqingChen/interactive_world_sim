@@ -123,6 +123,23 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.n_act = int(cfg.get("n_action_steps", 8))
         self.wm_max_chunks = int(cfg.get("wm_max_chunks", 40))
         self.jump_reject_deg = float(cfg.get("jump_reject_deg", 47.5))
+        # Area-ratio (vs frame 0) sanity bounds. REVISED from an initial [0.3, 3.0] --
+        # far too loose to catch WM hallucination in practice: a labeled dataset of
+        # 800 chunk-frames across 20 smooth_walk episodes (2 genuinely morphed, via
+        # direct visual inspection; 18 clean) showed [0.3,3.0] misses 97.8% of
+        # genuinely morphed frames, because IoU's rotation search "explains away"
+        # moderate deformation by finding SOME best-fit angle, while area growth is a
+        # much more direct fingerprint of hallucinated pixels accumulating in the
+        # mask (real physics keeps area within [0.86, 1.22] under a fixed overhead
+        # camera; morphed frames in that same dataset ranged [1.10, 2.23], mostly well
+        # above 1.25). [0.75, 1.20] gives 0.1% false-positive / 2.2% false-negative on
+        # that labeled set (vs 0%/97.8% for the old bound) -- area_ratio_low is more
+        # generous than area_ratio_high because occlusion (normal, expected -- the
+        # gripper covers part of the T in every frame of this task) shrinks area,
+        # while hallucination artifacts (color bleed, blur, extra red pixels) grow it;
+        # these are different mechanisms and don't need a symmetric bound.
+        self.area_ratio_low = float(cfg.get("area_ratio_low", 0.75))
+        self.area_ratio_high = float(cfg.get("area_ratio_high", 1.20))
         # Hard floor on est_angle_with_conf's best-match IoU. REVISED from an initial
         # 0.5 down to 0.35 after direct evidence it was rejecting legitimate frames:
         # a smooth_walk diagnostic run's morph-rejects clustered at IoU 0.34-0.50
@@ -255,6 +272,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self._lost_track_count = getattr(self, "_lost_track_count", 0)  # no mask / area sanity fail on every candidate frame
         self._morph_reject_count = getattr(self, "_morph_reject_count", 0)  # mask present & right-sized, but IoU below floor on every candidate frame
         self._stuck_recovery_count = getattr(self, "_stuck_recovery_count", 0)  # times the stuck-prev escape hatch fired
+        self._morph_terminate_count = getattr(self, "_morph_terminate_count", 0)  # times an episode was force-ended by morph detection
 
         self._reset_metrics()
         self._is_start = False
@@ -274,7 +292,16 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
     # -------------------------------------------------------------- reward
     def _robust_angle_end(self, dec_u8_last3, row):
         """dec_u8_last3: list of up-to-3 uint8 (128,128,3) frames (most recent last),
-        for row `row`. Returns (angle_end_rad, accepted: bool)."""
+        for row `row`. Returns (angle_end_rad, accepted: bool, morph_detected: bool).
+
+        morph_detected specifically means "mask area grew past area_ratio_high" --
+        the validated signature of the T deforming into a hallucinated blob (see
+        area_ratio_high's definition in _build_dataset for the labeled-data evidence:
+        area growth separates genuinely-morphed frames from merely-occluded-but-correct
+        ones far better than IoU does). Callers (chunk_step) should terminate the
+        episode when this fires -- once the WM has visibly hallucinated the object out
+        of its correct shape, continuing the rollout wastes compute on an uninformative
+        trajectory rather than getting a fresh one via reset."""
         templates, tc = self._templates[row], self._tc[row]
         f0_area = self._frame0_area[row]
         prev = float(self.angle_prev[row])
@@ -282,15 +309,22 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         raw = []  # (angle_or_None, iou, area) for ALL 3 frames, unfiltered -- for diagnostics
         reads = []  # (angle, iou) for frames that pass BOTH sanity checks
         any_mask_ok = False  # at least one frame had a plausible-area mask (area check passed)
+        morph_detected = False  # at least one frame's area exceeded area_ratio_high
         for frame in dec_u8_last3:
             angle, iou, area = est_angle_with_conf(frame, templates, tc, thetas=REWARD_THETAS)
             raw.append((angle, iou, area))
             if angle is None:
                 continue
+            if area > self.area_ratio_high * f0_area:
+                morph_detected = True
             # area sanity: reject if the mask ballooned/collapsed vs frame 0's own area
             # (fixed overhead camera -> the T's projected area shouldn't swing wildly
-            # under pure rotation; a big deviation flags occlusion/color hallucination)
-            if area < 0.3 * f0_area or area > 3.0 * f0_area:
+            # under pure rotation; a big deviation flags occlusion/color hallucination).
+            # Bounds tightened from an original [0.3,3.0] to [area_ratio_low,
+            # area_ratio_high] (default [0.75,1.20]) -- see _build_dataset for the
+            # labeled-data evidence this was necessary (the loose bound missed 97.8%
+            # of genuinely morphed frames in a validation set).
+            if area < self.area_ratio_low * f0_area or area > self.area_ratio_high * f0_area:
                 continue
             any_mask_ok = True
             # HARD IoU floor. See min_iou's definition (_build_dataset) for why this is
@@ -314,8 +348,9 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                 self._debug_log.append(dict(
                     row=row, kind=("morph" if any_mask_ok else "lost"),
                     raw=raw, f0_area=f0_area, prev_deg=np.degrees(prev),
+                    morph_detected=morph_detected,
                 ))
-            return prev, False  # carry forward, not accepted (prog=0 for this chunk)
+            return prev, False, morph_detected  # carry forward, not accepted (prog=0 for this chunk)
 
         # confidence-weighted median: sort by angle, pick the read whose cumulative
         # IoU-weight crosses the halfway point (a simple, dependency-free weighted
@@ -347,18 +382,18 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                         prev_deg=np.degrees(prev), candidate_deg=np.degrees(candidate),
                         jump_deg=jump_deg,
                     ))
-                return candidate, True
+                return candidate, True, morph_detected
             self._jump_reject_count += 1
             if hasattr(self, "_debug_log") and self._debug_log is not None:
                 self._debug_log.append(dict(
                     row=row, kind="jump", raw=raw, f0_area=f0_area,
                     prev_deg=np.degrees(prev), candidate_deg=np.degrees(candidate),
-                    jump_deg=jump_deg,
+                    jump_deg=jump_deg, morph_detected=morph_detected,
                 ))
-            return prev, False
+            return prev, False, morph_detected
 
         self._consec_reject[row] = 0
-        return candidate, True
+        return candidate, True, morph_detected
 
     # -------------------------------------------------------------- chunk_step
     @torch.no_grad()
@@ -405,18 +440,41 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         k = min(3, n_act)
         rewards_last = torch.zeros(B, dtype=torch.float32, device=device)
         terminations_last = torch.zeros(B, dtype=torch.bool, device=device)
+        morph_terminate = torch.zeros(B, dtype=torch.bool, device=device)
         for b in range(B):
             last_frames = [dec_u8[b, j] for j in range(n_act - k, n_act)]
-            angle_end, _accepted = self._robust_angle_end(last_frames, b)
+            angle_end, _accepted, morph_detected = self._robust_angle_end(last_frames, b)
+            if morph_detected and _accepted and hasattr(self, "_debug_log") and self._debug_log is not None:
+                # The reject path already logs a "morph" debug_log entry itself; this
+                # covers the accept path (a neighbor frame in the window was valid, but
+                # another frame in the same window still showed hallucinated growth).
+                self._debug_log.append(dict(
+                    row=b, kind="morph_terminate_on_accept", raw=[],
+                    prev_deg=np.degrees(float(self.angle_prev[b])),
+                    candidate_deg=np.degrees(angle_end),
+                ))
             prog = float(self.angle_prev[b]) - angle_end
-            success = bool(angle_end <= np.radians(self.terminal_deg))
+            # Suppress the success bonus on a morph-detected chunk -- angle_end here is
+            # either a carried-forward stale `prev` (reject path) or a neighbor-frame
+            # reading from the same window that happened to pass (accept path); neither
+            # is a trustworthy basis for declaring success once the mask itself has
+            # shown hallucinated growth in this window.
+            success = bool(angle_end <= np.radians(self.terminal_deg)) and not morph_detected
             rewards_last[b] = prog * 5.0 - 0.01 + (5.0 if success else 0.0)
             terminations_last[b] = success
+            morph_terminate[b] = morph_detected
             self.angle_prev[b] = angle_end
+        if morph_terminate.any():
+            self._morph_terminate_count = getattr(self, "_morph_terminate_count", 0) + int(morph_terminate.sum())
 
-        truncations_last = torch.full(
+        # Per-row truncation: normal step-budget exhaustion, OR morph detected this
+        # chunk -- per user direction, once the WM has visibly hallucinated the T out
+        # of shape, end the episode rather than continuing to roll out an
+        # uninformative trajectory (a fresh reset gets more useful data per GPU-second
+        # than persisting through a degenerate rollout).
+        truncations_last = (torch.full(
             (B,), self.steps >= self.wm_max_chunks, dtype=torch.bool, device=device
-        )
+        ) | morph_terminate)
 
         chunk_rewards = torch.zeros(B, n_act, dtype=torch.float32, device=device)
         chunk_rewards[:, -1] = rewards_last
@@ -441,6 +499,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         infos["lost_track_count"] = self._lost_track_count
         infos["morph_reject_count"] = self._morph_reject_count
         infos["stuck_recovery_count"] = self._stuck_recovery_count
+        infos["morph_terminate_count"] = self._morph_terminate_count
 
         return (
             [extracted_obs],

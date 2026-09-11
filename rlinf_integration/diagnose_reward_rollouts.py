@@ -118,6 +118,7 @@ def main():
 
     B, n_act, wm_max_chunks = env.num_envs, env.n_act, env.wm_max_chunks
     frames_log = [[] for _ in range(B)]  # per-row list of (frame_u8, angle_deg, reward, accepted, reject_reason)
+    frame0_u8 = env.frame0_u8.copy()  # (B,128,128,3) -- the real reset frame each row's templates are anchored to
 
     # smooth_walk state: per-row current chunk-target, initialized at each row's real
     # starting EE-xy (env.curr_state right after reset == home_xy).
@@ -142,6 +143,7 @@ def main():
         curr_img = (env.curr_img.clamp(0, 1) * 255).round().byte().permute(0, 2, 3, 1).cpu().numpy()
         reward_last = rewards[:, -1].cpu().numpy()
         term_last = terms[:, -1].cpu().numpy()
+        trunc_last = truncs[:, -1].cpu().numpy()
         angle_deg = np.degrees(env.angle_prev.numpy())
         # Per-row reject reason from THIS step's new _debug_log entries only, keyed by
         # `row` -- env._{lost,morph,jump}_reject_count are BATCH-WIDE scalars, so
@@ -155,23 +157,24 @@ def main():
             reason_by_row[ev["row"]] = ev["kind"].upper()
         for b in range(B):
             reason = reason_by_row.get(b, "")
-            # stuck_recovery is an ACCEPT (the chunk's candidate reading IS trusted,
-            # just flagged as arriving via the recovery path) -- not a reject like the
-            # other three kinds.
-            accepted = (reason == "") or (reason == "STUCK_RECOVERY")
+            # stuck_recovery and morph_terminate_on_accept are ACCEPTS (the chunk's
+            # candidate reading IS trusted) -- not rejects like the other kinds.
+            accepted = reason in ("", "STUCK_RECOVERY", "MORPH_TERMINATE_ON_ACCEPT")
             frames_log[b].append((
                 curr_img[b].copy(), float(angle_deg[b]), float(reward_last[b]),
-                accepted, reason, bool(term_last[b]),
+                accepted, reason, bool(term_last[b]), bool(trunc_last[b]),
             ))
         if step % 10 == 0:
             print(f"  step {step}/{wm_max_chunks}  lost={env._lost_track_count} "
                   f"morph_reject={env._morph_reject_count} jump_reject={env._jump_reject_count} "
-                  f"stuck_recovery={env._stuck_recovery_count}",
+                  f"stuck_recovery={env._stuck_recovery_count} "
+                  f"morph_terminate={getattr(env, '_morph_terminate_count', 0)}",
                   flush=True)
 
     n_accepted = B * wm_max_chunks - env._lost_track_count - env._morph_reject_count - env._jump_reject_count
     print(f"lost_track={env._lost_track_count}  morph_reject={env._morph_reject_count}  "
           f"jump_reject={env._jump_reject_count}  stuck_recovery={env._stuck_recovery_count}  "
+          f"morph_terminate={getattr(env, '_morph_terminate_count', 0)}  "
           f"accepted={n_accepted}  (out of {B * wm_max_chunks} chunk-reads)")
 
     # Summarize what actually drove each rejection -- the IoU/area of every candidate
@@ -211,14 +214,19 @@ def main():
 
     for b in range(B):
         vid = []
-        for (img, ang, rew, accepted, reason, term) in frames_log[b]:
+        for (img, ang, rew, accepted, reason, term, trunc) in frames_log[b]:
             f = cv2.resize(img, (384, 384), interpolation=cv2.INTER_NEAREST)
-            color = (0, 255, 0) if accepted else (0, 0, 255)
+            morph_term = reason in ("MORPH", "MORPH_TERMINATE_ON_ACCEPT") and trunc
+            color = (0, 165, 255) if morph_term else ((0, 255, 0) if accepted else (0, 0, 255))
             lines = [f"angle={ang:+.1f} deg   reward={rew:+.2f}"]
             if not accepted:
                 lines.append(f"REJECTED: {reason}")
             elif reason == "STUCK_RECOVERY":
                 lines.append("accepted via stuck-recovery")
+            if morph_term:
+                lines.append("EPISODE TRUNCATED: morph detected")
+            elif trunc:
+                lines.append("TRUNCATED (step budget)")
             if term:
                 lines.append("TERMINATED (success)")
             vid.append(label(f, lines, color))
@@ -226,6 +234,13 @@ def main():
         imageio.mimwrite(out_path, np.stack(vid), fps=8, codec="libx264",
                          pixelformat="yuv420p", output_params=["-crf", "20"])
     print(f"\nWrote {B} rollout videos to {out_dir}/")
+
+    # Raw (uncompressed) decoded frames + frame0, for precise IoU/area threshold
+    # tuning -- mp4 (h264, crf=20) is fine to look at but not ideal to recompute exact
+    # IoU/area numbers from.
+    raw_imgs = np.stack([[f[0] for f in frames_log[b]] for b in range(B)])  # (B, wm_max_chunks, 128,128,3) u8
+    np.savez(out_dir / "raw_frames.npz", frames=raw_imgs, frame0=frame0_u8)
+    print(f"Raw frames for threshold tuning: {out_dir / 'raw_frames.npz'}")
     env.close()
 
 
