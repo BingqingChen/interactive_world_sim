@@ -193,7 +193,7 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         B = actions_np.shape[0]
         actions_np = actions_np.reshape(B, self.n_act, 4)  # (B,1,32) -> (B,8,4) genuine waypoint chunk
 
-        imgs, aps, rewards, terminations, truncations, successes = self._send(b"\x02", actions_np)
+        imgs, aps, final_imgs, final_aps, rewards, terminations, truncations, successes = self._send(b"\x02", actions_np)
         obs = self._wrap_obs(imgs, aps)
         device = self.device
         rewards_t = torch.from_numpy(rewards).to(device)
@@ -209,6 +209,38 @@ class IWSRotateTSimEnv(BaseWorldEnv):
 
         infos = self._record_metrics(rewards_t, term_t, {})
         infos["success"] = successes
+
+        done_t = term_t | trunc_t
+        if done_t.any():
+            # env_worker.py's env_interact_step unconditionally indexes
+            # infos["final_info"]["..."] once ANY row is done (not guarded by an
+            # "in infos" check on that particular line, unlike a neighboring one)
+            # -- omitting this crashed the FIRST time any episode actually
+            # completed (KeyError: 'final_info'), not caught by earlier short
+            # smoke tests where episodes hadn't finished yet.
+            #
+            # "final_observation" is ALSO required, not just nice-to-have:
+            # env_worker.py's append_transitions asserts next_obs is not None,
+            # and next_obs = infos["final_observation"] whenever any row is done
+            # -- confirmed via a second real crash (AssertionError in
+            # append_transitions) after fixing the first. Unlike
+            # IWSRotateTWorldEnv (batch-sync reset), real_sim_chunk_server.py
+            # does per-row auto-reset transparently server-side (see module
+            # docstring), so the pre-reset terminal obs isn't naturally
+            # available here -- fixed by having the server report BOTH the
+            # post-reset obs (imgs/aps, used for the NEXT step) AND each row's
+            # own pre-reset terminal obs (final_imgs/final_aps) in every
+            # step_chunk response, see that module's docstring.
+            infos["final_observation"] = self._wrap_obs(final_imgs, final_aps)
+            # dict(infos), NOT infos itself: `infos["final_info"] = infos` would
+            # make infos contain itself (infos["final_info"]["final_info"]...
+            # forever) -- confirmed via a real crash, RecursionError in
+            # put_tensor_device's unguarded recursive nested-dict walk
+            # (embodied_types.py's EnvOutput.__post_init__), the first time an
+            # episode actually completed under a longer smoke run.
+            infos["final_info"] = dict(infos)
+            infos["_final_info"] = done_t
+            infos["_final_observation"] = done_t
 
         return ([obs], chunk_rewards, chunk_terminations, chunk_truncations, [infos])
 

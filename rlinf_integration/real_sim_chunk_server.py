@@ -25,12 +25,16 @@ Protocol (binary, over stdin/stdout pipes):
     actor.model.action_dim = 4*n_action_steps and reshaping client-side).
   response: 8-byte big-endian length header + that many pickled bytes of:
     reset_all -> (imgs (B,n_obs,3,128,128) f32 [0,1], aps (B,n_obs,4) f32)
-    step_chunk -> (imgs, aps, rewards (B,) f32, terminations (B,) bool,
-                   truncations (B,) bool, successes (B,) bool)
+    step_chunk -> (imgs, aps, final_imgs, final_aps, rewards (B,) f32,
+                   terminations (B,) bool, truncations (B,) bool, successes (B,) bool)
     where imgs/aps are the POST-STEP (and post-auto-reset, per row, for any row
     whose episode just ended -- matching AlohaChunkEnv/ppo_residual_rotate_t.py's
-    own per-row independent reset convention, not the WM env's batch-synchronous one
-    -- real-sim resets are cheap, no reason to force batch-sync semantics here).
+    own per-row independent reset convention -- see below) and final_imgs/final_aps
+    are each row's own PRE-reset terminal obs (== imgs/aps for a row that didn't
+    finish this call). RLinf's trajectory builder needs a real terminal next_obs
+    for the transition that just ended (append_transitions asserts it's not
+    None) -- imgs/aps alone can't supply this for a finished row, since they're
+    already the NEXT episode's post-reset obs by the time this responds.
   EOF on stdin -> server exits.
 
 Usage (spawned by IWSRotateTSimEnv._build_dataset, not run manually):
@@ -118,10 +122,19 @@ def main():
             send((np.stack(imgs), np.stack(aps)))
         elif req == b"\x02":  # step_chunk
             actions = recv_payload()  # (B, n_act, 4) float32 -- genuine waypoint chunk per env
-            imgs, aps, rewards, terminations, truncations, successes = [], [], [], [], [], []
+            imgs, aps, final_imgs, final_aps, rewards, terminations, truncations, successes = (
+                [], [], [], [], [], [], [], [])
             for i, e in enumerate(envs):
                 (img_h, ap_h), rew, done, info = e.step_chunk(actions[i])
                 ok = bool(info["success"])
+                # Pre-reset (this row's own terminal) obs -- RLinf's trajectory
+                # builder needs a real next_obs for the transition that just
+                # ended, not the NEXT episode's post-reset obs (append_transitions
+                # asserts next_obs is not None; a real crash confirmed the client
+                # must actually supply this, not just omit "final_observation" as
+                # a silently-safe fallback).
+                final_imgs.append(img_h)
+                final_aps.append(ap_h)
                 if done:
                     # per-row independent reset, matching AlohaChunkEnv's own usage
                     # convention in ppo_residual_rotate_t.py (not batch-sync -- real
@@ -137,7 +150,8 @@ def main():
                 terminations.append(bool(done and ok))
                 truncations.append(bool(done and not ok))
                 successes.append(ok)
-            send((np.stack(imgs), np.stack(aps), np.array(rewards, np.float32),
+            send((np.stack(imgs), np.stack(aps), np.stack(final_imgs), np.stack(final_aps),
+                 np.array(rewards, np.float32),
                  np.array(terminations, bool), np.array(truncations, bool),
                  np.array(successes, bool)))
         else:

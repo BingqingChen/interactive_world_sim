@@ -523,22 +523,35 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         chunk_truncations[:, -1] = truncations_last
 
         past_dones = terminations_last | truncations_last
-        extracted_obs = self._wrap_obs()
+        pre_reset_obs = self._wrap_obs()
         infos = {}
-        if past_dones.any():
-            # Batch-synchronous reset, matching RLinf's own WanEnv._handle_auto_reset
-            # precedent for world-model envs (see module docstring).
-            final_obs = extracted_obs
-            infos["final_observation"] = final_obs
-            infos["_final_observation"] = past_dones
-            extracted_obs, _ = self.reset()
-
         infos = self._record_metrics(rewards_last, terminations_last, infos)
         infos["jump_reject_count"] = self._jump_reject_count
         infos["lost_track_count"] = self._lost_track_count
         infos["morph_reject_count"] = self._morph_reject_count
         infos["stuck_recovery_count"] = self._stuck_recovery_count
         infos["morph_terminate_count"] = self._morph_terminate_count
+
+        if past_dones.any():
+            # Batch-synchronous reset, matching RLinf's own WanEnv._handle_auto_reset
+            # precedent for world-model envs (see module docstring) -- including
+            # infos["final_info"]/"final_observation"/"_final_info"/"_final_observation",
+            # which env_worker.py's env_interact_step unconditionally indexes
+            # (infos["final_info"]["..."]) once ANY row is done, not guarded by an
+            # "in infos" check on that particular line (unlike a neighboring one).
+            # Omitting these crashed the FIRST time any episode actually completed --
+            # not caught by earlier short smoke tests, where episodes hadn't finished
+            # yet (KeyError: 'final_info' in env_worker.py:554, confirmed via two
+            # real training-run crashes).
+            final_info = infos
+            final_obs = pre_reset_obs
+            extracted_obs, infos = self.reset()
+            infos["final_observation"] = final_obs
+            infos["final_info"] = final_info
+            infos["_final_info"] = past_dones
+            infos["_final_observation"] = past_dones
+        else:
+            extracted_obs = pre_reset_obs
 
         return (
             [extracted_obs],
