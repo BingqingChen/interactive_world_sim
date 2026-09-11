@@ -135,7 +135,7 @@ def main():
             alphas = np.linspace(1.0 / n_act, 1.0, n_act, dtype=np.float32)  # (n_act,)
             actions = (prev_target[:, None, :] +
                       alphas[None, :, None] * (walk_target - prev_target)[:, None, :]).astype(np.float32)
-        prev_lost, prev_morph, prev_jump = env._lost_track_count, env._morph_reject_count, env._jump_reject_count
+        prev_debug_len = len(env._debug_log)
         obs_list, rewards, terms, truncs, infos_list = env.chunk_step(torch.from_numpy(actions))
         # per-row bookkeeping: pull the last decoded frame + this chunk's angle/reward
         # straight off env's own post-step state (angle_prev already updated in-place).
@@ -143,17 +143,25 @@ def main():
         reward_last = rewards[:, -1].cpu().numpy()
         term_last = terms[:, -1].cpu().numpy()
         angle_deg = np.degrees(env.angle_prev.numpy())
+        # Per-row reject reason from THIS step's new _debug_log entries only, keyed by
+        # `row` -- env._{lost,morph,jump}_reject_count are BATCH-WIDE scalars, so
+        # "did the global counter change this step" is NOT a valid per-row label (an
+        # earlier version of this script used that and mislabeled every row in the
+        # batch whenever ANY single row rejected, badly over-reporting rejects in the
+        # rendered videos).
+        new_events = env._debug_log[prev_debug_len:]
+        reason_by_row = {}
+        for ev in new_events:
+            reason_by_row[ev["row"]] = ev["kind"].upper()
         for b in range(B):
-            reason = ""
-            if env._lost_track_count > prev_lost:
-                reason = "LOST"
-            elif env._morph_reject_count > prev_morph:
-                reason = "MORPH-REJECT"
-            elif env._jump_reject_count > prev_jump:
-                reason = "JUMP-REJECT"
+            reason = reason_by_row.get(b, "")
+            # stuck_recovery is an ACCEPT (the chunk's candidate reading IS trusted,
+            # just flagged as arriving via the recovery path) -- not a reject like the
+            # other three kinds.
+            accepted = (reason == "") or (reason == "STUCK_RECOVERY")
             frames_log[b].append((
                 curr_img[b].copy(), float(angle_deg[b]), float(reward_last[b]),
-                reason == "", reason, bool(term_last[b]),
+                accepted, reason, bool(term_last[b]),
             ))
         if step % 10 == 0:
             print(f"  step {step}/{wm_max_chunks}  lost={env._lost_track_count} "
@@ -209,6 +217,8 @@ def main():
             lines = [f"angle={ang:+.1f} deg   reward={rew:+.2f}"]
             if not accepted:
                 lines.append(f"REJECTED: {reason}")
+            elif reason == "STUCK_RECOVERY":
+                lines.append("accepted via stuck-recovery")
             if term:
                 lines.append("TERMINATED (success)")
             vid.append(label(f, lines, color))
