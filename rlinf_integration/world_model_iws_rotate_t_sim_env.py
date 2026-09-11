@@ -60,6 +60,17 @@ class IWSRotateTSimEnv(BaseWorldEnv):
             "feasible_mask", str(IWS_ROOT / "datasets/feasible_mask_v3.json")
         )
         env_seed_base = int(cfg.get("env_seed_base", 42))
+        # "single": main_images/states are RLinf's native format exactly (current
+        # frame only, matching WanEnv._wrap_obs and CNNPolicy.get_dummy_input's
+        # (B,H,W,C) image / (B,state_dim) state contract -- no frame-history dim at
+        # all). "concat_state": same single-frame image, but states is the
+        # concatenation of the previous+current EE-xy (state_dim doubles) to keep
+        # velocity-like information without touching the image channel count (which
+        # would risk breaking the pretrained ResNet encoder's first-conv-layer shape).
+        # Run both side-by-side (2 GPUs available) rather than guess which matters
+        # for this task -- see the plan doc for the reasoning.
+        self.state_history = cfg.get("state_history", "single")
+        assert self.state_history in ("single", "concat_state")
 
         server_script = Path(__file__).parent / "real_sim_chunk_server.py"
         self._sim_proc = subprocess.Popen(
@@ -107,14 +118,36 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         return pickle.loads(proc.stdout.read(length))
 
     def _wrap_obs(self, imgs, aps):
-        """Matches this project's own obs-dict convention (same as IWSRotateTWorldEnv
-        and diffusion_unet_hybrid_image_policy.predict_action): {"image":
-        (B,n_obs,3,128,128) f32 [0,1], "agent_pos": (B,n_obs,4) f32}. imgs/aps come
-        directly from AlohaChunkEnv's own np.stack(self.img_h)/np.stack(self.ap_h),
-        no reshaping needed."""
-        image = torch.from_numpy(imgs).to(self.device)
-        agent_pos = torch.from_numpy(aps).to(self.device)
-        return {"image": image, "agent_pos": agent_pos}
+        """RLinf's OWN obs-dict contract (CNNPolicy.preprocess_env_obs /
+        get_dummy_input, matching WanEnv._wrap_obs) -- NOT this project's
+        diffusion_policy convention ({"image":(B,n_obs,3,H,W) f32 [0,1] CHW,
+        "agent_pos":...}), which an earlier version of this env (and
+        IWSRotateTWorldEnv, not yet fixed there) mistakenly used out of habit and
+        would have crashed on the first real forward pass (KeyError: 'main_images').
+        RLinf expects:
+          "main_images": (B,H,W,3) HWC, values in [0,255] (CNNPolicy does /255.0
+              internally in preprocess_env_obs -- do NOT pre-normalize here)
+          "states": (B,state_dim) -- a single flat vector, no frame-history dim
+        imgs/aps arrive as (B,n_obs=2,...) from AlohaChunkEnv's own 2-deep obs
+        history; this env only ever uses the LATEST (most recent) frame for
+        main_images (single-frame, per RLinf's native convention -- concatenating
+        frames channel-wise would change the pretrained ResNet encoder's expected
+        input channel count, a real risk not worth taking here). For states,
+        self.state_history controls whether the previous frame's state is folded in
+        too (state_dim doubles to preserve velocity-like info) -- see
+        _build_dataset's comment for why this is being run as a side-by-side
+        comparison rather than decided in advance."""
+        last_img = imgs[:, -1]  # (B,3,128,128) f32 [0,1] CHW
+        main_images = torch.from_numpy(last_img).to(self.device)
+        main_images = (main_images.permute(0, 2, 3, 1) * 255.0)  # -> (B,128,128,3) [0,255]
+
+        if self.state_history == "single":
+            states_np = aps[:, -1]  # (B,4)
+        else:  # concat_state
+            states_np = np.concatenate([aps[:, -2], aps[:, -1]], axis=-1)  # (B,8)
+        states = torch.from_numpy(states_np).to(self.device)
+
+        return {"main_images": main_images, "states": states}
 
     # ------------------------------------------------------------------ reset
     def reset(self, *, seed=None, options: Optional[dict] = None):
