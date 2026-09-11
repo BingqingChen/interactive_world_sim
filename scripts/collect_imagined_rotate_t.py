@@ -105,6 +105,33 @@ def est_angle(img, templates, tc):
     return float(THETAS[np.argmax(inter / np.maximum(union, 1))])
 
 
+def est_angle_with_conf(img, templates, tc):
+    """Like est_angle, but also returns the best-match IoU (confidence) and the raw
+    mask pixel count, for callers that need to reject low-confidence / degenerate
+    reads rather than just "no T visible at all" (mask.sum() < 30). Used by the RLPD
+    world-model env's hardened reward readout (see rlinf_integration/); est_angle
+    itself is left untouched so existing callers (find_terminal_frame, eval_wm_quality)
+    are unaffected.
+
+    Returns (angle_rad_or_None, best_iou, mask_pixel_count)."""
+    import cv2
+    m = red_mask(img)
+    area = int(m.sum())
+    if area < 30:
+        return None, 0.0, area
+    ys, xs = np.nonzero(m)
+    m_al = cv2.warpAffine(
+        m.astype(np.uint8),
+        np.float32([[1, 0, tc[1] - xs.mean()], [0, 1, tc[0] - ys.mean()]]),
+        (m.shape[1], m.shape[0]),
+    ) > 0
+    inter = (templates & m_al).sum(axis=(1, 2))
+    union = (templates | m_al).sum(axis=(1, 2))
+    iou = inter / np.maximum(union, 1)
+    best = int(np.argmax(iou))
+    return float(THETAS[best]), float(iou[best]), area
+
+
 def find_terminal_frame(ep_imgs, templates, tc, stride=4):
     """First frame index where the T crosses TERMINAL_DEG (with a persistence
     check against single-frame hallucination flicker), or None."""
