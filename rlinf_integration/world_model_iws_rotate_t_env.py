@@ -481,28 +481,40 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                     prev_deg=np.degrees(float(self.angle_prev[b])),
                     candidate_deg=np.degrees(angle_end),
                 ))
-            prog = float(self.angle_prev[b]) - angle_end
-            # Suppress the success bonus on a morph-detected chunk -- angle_end here is
-            # either a carried-forward stale `prev` (reject path) or a neighbor-frame
-            # reading from the same window that happened to pass (accept path); neither
-            # is a trustworthy basis for declaring success once the mask itself has
-            # shown hallucinated growth in this window.
-            success = bool(angle_end <= np.radians(self.terminal_deg)) and not morph_detected
+            # On a morph-detected chunk, the reward is exactly the per-step time
+            # penalty -0.01 -- no progress credit, no success bonus. angle_end
+            # here is either a carried-forward stale `prev` (reject path) or a
+            # neighbor-frame reading from the same window that happened to pass
+            # (accept path); neither is a trustworthy basis for crediting
+            # progress OR declaring success once the mask itself has shown
+            # hallucinated growth in this window. angle_prev is also NOT
+            # advanced to this untrustworthy angle_end -- freezing it at the
+            # last trustworthy value prevents a spurious progress spike (or
+            # dip) on the NEXT good chunk, which would otherwise measure
+            # "progress" against a baseline that was itself hallucinated.
+            if morph_detected:
+                prog = 0.0
+                success = False
+            else:
+                prog = float(self.angle_prev[b]) - angle_end
+                success = bool(angle_end <= np.radians(self.terminal_deg))
+                self.angle_prev[b] = angle_end
             rewards_last[b] = prog * 5.0 - 0.01 + (5.0 if success else 0.0)
             terminations_last[b] = success
             # Patience, not immediate truncation -- see morph_terminate_patience's
             # definition (_build_dataset) for the full-pool evidence this was
             # necessary (immediate truncation discarded ~43% of episodes for
             # single-chunk artifacts that self-correct ~99% of the time). The
-            # success-bonus suppression above still fires on ANY morph_detected
+            # reward/success suppression above still fires on ANY morph_detected
             # chunk regardless of patience -- that's a separate, still-correct
-            # safety property (never credit success from an untrustworthy read).
+            # safety property (never credit progress or success from an
+            # untrustworthy read, even while the episode is still allowed to
+            # continue).
             if morph_detected:
                 self._consec_morph[b] += 1
             else:
                 self._consec_morph[b] = 0
             morph_terminate[b] = self._consec_morph[b] >= self.morph_terminate_patience
-            self.angle_prev[b] = angle_end
         if morph_terminate.any():
             self._morph_terminate_count = getattr(self, "_morph_terminate_count", 0) + int(morph_terminate.sum())
 
