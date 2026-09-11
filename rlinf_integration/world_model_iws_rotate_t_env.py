@@ -40,6 +40,10 @@ videos generated during planning: WM-proxy estimates diverged from ground truth 
     full real-demo pool before trusting this threshold for a real run (see plan doc).
 """
 
+import os
+import pickle
+import struct
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -56,12 +60,10 @@ IWS_ROOT = Path("/home/jacobhb/projects/worth_doing/interactive_world_sim/.claud
 sys.path.insert(0, str(IWS_ROOT / "scripts"))
 sys.path.insert(0, str(IWS_ROOT / "scripts" / "data_collection"))
 
-import eval_dp_rotate_t as E  # noqa: E402  (DT, K_P, K_V, ACC_LIM, VEL_LIM, get_obs)
-import collect_rotate_t as C  # noqa: E402  (stabilize_t, settle_arms, t_angle, make_upright_pose_sampler, UPRIGHT_TOL)
-import gym_aloha.env as gae  # noqa: E402
-from gym_aloha.env import AlohaEnv  # noqa: E402
-from yixuan_utilities.kinematics_helper import KinHelper  # noqa: E402
-from interactive_world_sim.utils.pose_utils import PoseType, pose_convert  # noqa: E402
+# venvs aren't git-tracked so worktrees don't have their own -- always use the main
+# checkout's, which is a stable, always-present resource independent of branch.
+IWS_VENV_PYTHON = "/home/jacobhb/projects/worth_doing/interactive_world_sim/.venv/bin/python"
+
 from interactive_world_sim.algorithms.common.diffusion_helper import render_img_cm  # noqa: E402
 import eval_metric_correlation as M  # noqa: E402  (load_viz_cfg, load_model)
 from collect_imagined_rotate_t import (  # noqa: E402
@@ -92,11 +94,24 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
 
     # ------------------------------------------------------------------ setup
     def _build_dataset(self, cfg):
-        """One-time setup: load the WM, build the real reset env + pose sampler +
-        feasible-mask region check. Returns None -- unlike WanEnv (which draws from a
-        fixed pre-recorded initial-frame dataset), this env generates each episode's
-        initial frame live from a real MuJoCo reset, so there is no fixed "dataset" to
-        hold; self.dataset is unused by this env beyond the abstract-method contract."""
+        """One-time setup: load the WM, spawn the persistent real-reset server.
+        Returns None -- unlike WanEnv (which draws from a fixed pre-recorded
+        initial-frame dataset), this env generates each episode's initial frame live
+        from a real MuJoCo reset, so there is no fixed "dataset" to hold;
+        self.dataset is unused by this env beyond the abstract-method contract.
+
+        The real reset (AlohaEnv + KinHelper's SAPIEN-based IK) runs in a SEPARATE
+        persistent subprocess under IWS's own venv, not in-process here -- running
+        dm_control(EGL) and SAPIEN's IK solver together in RLinf's venv segfaults
+        (a native-library conflict, root cause not found; reproduces even with
+        package versions identical to IWS's own working venv -- see the plan doc's
+        "Blocking issue" section for the full bisection). The server is spawned ONCE
+        and answers reset requests for the rest of this env's life -- critical for
+        real training, where batch-synchronous reset (see chunk_step) means every
+        row's episode end triggers a whole-batch reset, so a full run needs on the
+        order of 1000+ real resets; a fresh subprocess per reset would pay full
+        interpreter-plus-heavy-import startup cost every time, dwarfing the WM's own
+        diffusion-sampling cost."""
         self.n_act = int(cfg.get("n_action_steps", 8))
         self.wm_max_chunks = int(cfg.get("wm_max_chunks", 40))
         self.jump_reject_deg = float(cfg.get("jump_reject_deg", 47.5))
@@ -116,58 +131,55 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         wm_config = cfg.get("wm_config", "pusht_mujoco")
         env_seed_base = int(cfg.get("env_seed_base", 700_000))
 
-        import json
-
-        self.env_seed_base = env_seed_base
-        self._reset_trial = 0
-
         vcfg = M.load_viz_cfg(wm_config)
         self.wm = M.load_model(wm_ckpt, vcfg.algorithm, self._get_runtime_device_str())
         self.wm.dec_infer_steps = self.dec_infer_steps
 
-        self._real_env = AlohaEnv("pusht")
-        self._kin = KinHelper(robot_name="trossen_vx300s")
-        gae.sample_pusht_pose = C.make_upright_pose_sampler(x_range, y_range)
-
-        m = json.loads(Path(feasible_mask_path).read_text())
-        self._mask = np.array(m["mask"], bool)
-        self._edges = np.array(m["grid_cm"]["edges"])
-
+        server_script = Path(__file__).parent / "real_reset_server.py"
+        self._reset_proc = subprocess.Popen(
+            [IWS_VENV_PYTHON, "-u", str(server_script),
+             "--x_min", str(x_range[0]), "--x_max", str(x_range[1]),
+             "--y_min", str(y_range[0]), "--y_max", str(y_range[1]),
+             "--feasible_mask", str(feasible_mask_path),
+             "--env_seed_base", str(env_seed_base),
+             "--iws_scripts_root", str(IWS_ROOT)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+            env={**os.environ, "MUJOCO_GL": "egl"},
+        )
         return None
 
-    def _in_feasible_region(self, env):
-        s = env._env.task.get_observation(env._env.physics)["env_state"]
-        x_cm, y_cm = s[0] * 100, s[1] * 100
-        e = self._edges
-        if not (e[0] <= x_cm < e[-1] and e[0] <= y_cm < e[-1]):
-            return False
-        i, j = int(np.digitize(x_cm, e) - 1), int(np.digitize(y_cm, e) - 1)
-        return bool(self._mask[i, j])
+    def close(self):
+        """Terminate the real-reset server subprocess. Not called automatically by
+        RLinf (no standard env-teardown hook found) -- call explicitly when done, or
+        rely on the OS cleaning it up when this process exits (best-effort only)."""
+        proc = getattr(self, "_reset_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
 
     def _one_real_reset(self):
         """One real AlohaEnv reset -> (image f32 (3,128,128) [0,1], home_xy f32 (4,),
-        frame_u8 (128,128,3)). Retries until upright + inside the feasible mask,
-        mirroring get_initial_states' region-guard loop in collect_imagined_rotate_t.py."""
-        env = self._real_env
-        while True:
-            np.random.seed(self.env_seed_base + self._reset_trial)
-            env.reset(seed=self.env_seed_base + self._reset_trial)
-            self._reset_trial += 1
-            C.stabilize_t(env)
-            o = env._env.task.get_observation(env._env.physics)
-            lb = pose_convert(o["left_base"][None], PoseType.POS_QUAT, PoseType.MAT)[0]
-            rb = pose_convert(o["right_base"][None], PoseType.POS_QUAT, PoseType.MAT)[0]
-            world_t_bases = np.stack([lb, rb])
-            C.settle_arms(
-                env, world_t_bases, self._kin, np.zeros(6),
-                E.DT, E.K_P, E.K_V, E.ACC_LIM, E.VEL_LIM,
+        frame_u8 (128,128,3)), via a single request/response round-trip to the
+        persistent real_reset_server subprocess (see _build_dataset's docstring for
+        why this isn't done in-process)."""
+        proc = self._reset_proc
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"real_reset_server died (exit code {proc.returncode}) -- "
+                "no restart logic yet, see plan doc's open items"
             )
-            if abs(C.t_angle(env)) > C.UPRIGHT_TOL:
-                continue
-            if not self._in_feasible_region(env):
-                continue
-            image, agent_pos, frame_u8 = E.get_obs(env, self._kin, world_t_bases)
-            return image, agent_pos.astype(np.float32), frame_u8
+        proc.stdin.write(b"\x01")
+        proc.stdin.flush()
+        header = proc.stdout.read(8)
+        if len(header) < 8:
+            raise RuntimeError("real_reset_server closed its stdout unexpectedly")
+        (length,) = struct.unpack(">Q", header)
+        payload = proc.stdout.read(length)
+        image, home_xy, frame_u8 = pickle.loads(payload)
+        return image, home_xy.astype(np.float32), frame_u8
 
     # ------------------------------------------------------------------ reset
     @torch.no_grad()
@@ -330,26 +342,26 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.steps += 1
 
         k = min(3, n_act)
-        rewards_last = torch.zeros(B, dtype=torch.float32)
-        terminations_last = torch.zeros(B, dtype=torch.bool)
+        rewards_last = torch.zeros(B, dtype=torch.float32, device=device)
+        terminations_last = torch.zeros(B, dtype=torch.bool, device=device)
         for b in range(B):
             last_frames = [dec_u8[b, j] for j in range(n_act - k, n_act)]
             angle_end, _accepted = self._robust_angle_end(last_frames, b)
             prog = float(self.angle_prev[b]) - angle_end
-            success = angle_end <= np.radians(self.terminal_deg)
+            success = bool(angle_end <= np.radians(self.terminal_deg))
             rewards_last[b] = prog * 5.0 - 0.01 + (5.0 if success else 0.0)
             terminations_last[b] = success
             self.angle_prev[b] = angle_end
 
-        truncations_last = torch.tensor(
-            [self.steps >= self.wm_max_chunks] * B, dtype=torch.bool
+        truncations_last = torch.full(
+            (B,), self.steps >= self.wm_max_chunks, dtype=torch.bool, device=device
         )
 
-        chunk_rewards = torch.zeros(B, n_act, dtype=torch.float32)
+        chunk_rewards = torch.zeros(B, n_act, dtype=torch.float32, device=device)
         chunk_rewards[:, -1] = rewards_last
-        chunk_terminations = torch.zeros(B, n_act, dtype=torch.bool)
+        chunk_terminations = torch.zeros(B, n_act, dtype=torch.bool, device=device)
         chunk_terminations[:, -1] = terminations_last
-        chunk_truncations = torch.zeros(B, n_act, dtype=torch.bool)
+        chunk_truncations = torch.zeros(B, n_act, dtype=torch.bool, device=device)
         chunk_truncations[:, -1] = truncations_last
 
         past_dones = terminations_last | truncations_last

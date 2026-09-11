@@ -94,9 +94,9 @@ def main():
     # Random actions within the WM's own fitted action-normalizer range -- the most
     # representative "arbitrary but plausible-scale" distribution to stress-test with,
     # and exactly the kind of action an untrained/early-training RLPD actor would emit.
-    stats = env.wm.normalizer["action"].params_dict["action"]
-    a_min = stats["input_stats"]["min"].cpu().numpy().reshape(-1)
-    a_max = stats["input_stats"]["max"].cpu().numpy().reshape(-1)
+    stats = env.wm.normalizer["action"].get_input_stats()
+    a_min = stats["min"].detach().cpu().numpy().reshape(-1)
+    a_max = stats["max"].detach().cpu().numpy().reshape(-1)
     print(f"action range from WM normalizer: min={a_min} max={a_max}", flush=True)
     rng = np.random.default_rng(args.action_seed)
 
@@ -110,8 +110,8 @@ def main():
         # per-row bookkeeping: pull the last decoded frame + this chunk's angle/reward
         # straight off env's own post-step state (angle_prev already updated in-place).
         curr_img = (env.curr_img.clamp(0, 1) * 255).round().byte().permute(0, 2, 3, 1).cpu().numpy()
-        reward_last = rewards[:, -1].numpy()
-        term_last = terms[:, -1].numpy()
+        reward_last = rewards[:, -1].cpu().numpy()
+        term_last = terms[:, -1].cpu().numpy()
         angle_deg = np.degrees(env.angle_prev.numpy())
         for b in range(B):
             reason = ""
@@ -148,6 +148,7 @@ def main():
         imageio.mimwrite(out_path, np.stack(vid), fps=8, codec="libx264",
                          pixelformat="yuv420p", output_params=["-crf", "20"])
     print(f"\nWrote {B} rollout videos to {out_dir}/")
+    env.close()
 
 
 if __name__ == "__main__":
