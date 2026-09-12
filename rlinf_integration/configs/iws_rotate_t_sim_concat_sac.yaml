@@ -95,7 +95,16 @@ env:
 
   eval:
     rollout_epoch: 1
-    total_num_envs: 4
+    # N=4 (the earlier value) made the in-training eval/return curve noisy enough
+    # that a single low/high point was hard to interpret -- bumped to 20 to average
+    # over more episodes per eval call.
+    total_num_envs: 20
+    # Deliberately DIFFERENT from both env.train's env_seed_base (42, inherited from
+    # the env yaml default) and the canonical post-hoc protocol's eval seed
+    # (run_scaling_v3_sweep.py / eval_dp_rotate_t.py use --seed 9000) -- so the
+    # in-training eval score is an independent check, not reusing the exact same
+    # held-out init conditions the final reported number comes from.
+    env_seed_base: 500000
     max_steps_per_rollout_epoch: 20   # chunk_step calls per eval env, enough to let most episodes finish (max_episode_steps=100)
     video_cfg:
       save_video: True
