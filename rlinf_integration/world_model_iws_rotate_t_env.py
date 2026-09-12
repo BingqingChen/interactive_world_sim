@@ -538,6 +538,12 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         pre_reset_obs = self._wrap_obs()
         infos = {}
         infos = self._record_metrics(rewards_last, terminations_last, infos)
+        # See IWSRotateTSimEnv.chunk_step's identical line for why: surfaces
+        # BaseWorldEnv's own already-tracked self.success_once into
+        # infos["episode"] so it flows through to eval/success (a real success
+        # RATE, not just eyeballed from eval/return's magnitude) the same way
+        # "return" already does -- no RLinf-side (external repo) code touched.
+        infos["episode"]["success"] = self.success_once.clone().float()
         infos["jump_reject_count"] = self._jump_reject_count
         infos["lost_track_count"] = self._lost_track_count
         infos["morph_reject_count"] = self._morph_reject_count

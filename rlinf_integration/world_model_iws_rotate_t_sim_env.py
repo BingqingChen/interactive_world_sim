@@ -209,6 +209,17 @@ class IWSRotateTSimEnv(BaseWorldEnv):
 
         infos = self._record_metrics(rewards_t, term_t, {})
         infos["success"] = successes
+        # BaseWorldEnv._record_metrics already tracks self.success_once (sticky
+        # True once terminations fires, reset per-episode by _reset_metrics) but
+        # never surfaces it into infos["episode"] -- only "return" was being
+        # logged, so eval/return was the only in-training signal and success
+        # rate had to be eyeballed from its magnitude. env_worker.py pulls every
+        # key out of infos["episode"] (masked by done) into env_info, which
+        # compute_evaluate_metrics then .mean()s across envs and logs as
+        # eval/<key> exactly like eval/return -- so this one line is enough to
+        # get a real eval/success (a 0/1 mean = success RATE directly), no
+        # RLinf-side (external repo) code touched.
+        infos["episode"]["success"] = self.success_once.clone().float()
 
         done_t = term_t | trunc_t
         if done_t.any():
