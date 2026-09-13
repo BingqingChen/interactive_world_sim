@@ -213,6 +213,11 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         # path -- Path(__file__).parent without resolving would point at the RLinf
         # dir (where real_reset_server.py doesn't exist), not this worktree.
         server_script = Path(__file__).resolve().parent / "real_reset_server.py"
+        # See IWSRotateTSimEnv: `egl_device_id` overrides RLinf's per-worker
+        # MUJOCO_EGL_DEVICE_ID, which does not follow CUDA order on this box.
+        server_env = {**os.environ, "MUJOCO_GL": "egl"}
+        if cfg.get("egl_device_id", None) is not None:
+            server_env["MUJOCO_EGL_DEVICE_ID"] = str(cfg.get("egl_device_id"))
         self._reset_proc = subprocess.Popen(
             [IWS_VENV_PYTHON, "-u", str(server_script),
              "--x_min", str(x_range[0]), "--x_max", str(x_range[1]),
@@ -221,7 +226,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
              "--env_seed_base", str(env_seed_base),
              "--iws_scripts_root", str(IWS_ROOT)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
-            env={**os.environ, "MUJOCO_GL": "egl"},
+            env=server_env,
         )
         return None
 

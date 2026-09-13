@@ -77,6 +77,13 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         # path -- Path(__file__).parent without resolving would point at the RLinf
         # dir (where real_sim_chunk_server.py doesn't exist), not this worktree.
         server_script = Path(__file__).resolve().parent / "real_sim_chunk_server.py"
+        # RLinf sets MUJOCO_EGL_DEVICE_ID per worker, but on this 2-GPU box the
+        # value it gave workers training on GPU 0 (0) renders on GPU 1: EGL
+        # enumerates the GPUs in reverse CUDA order. `egl_device_id` pins the
+        # server's rendering explicitly (1 = GPU 0, 0 = GPU 1 here).
+        server_env = {**os.environ, "MUJOCO_GL": "egl"}
+        if cfg.get("egl_device_id", None) is not None:
+            server_env["MUJOCO_EGL_DEVICE_ID"] = str(cfg.get("egl_device_id"))
         self._sim_proc = subprocess.Popen(
             [IWS_VENV_PYTHON, "-u", str(server_script),
              "--num_envs", str(self.num_envs), "--max_steps", str(max_steps),
@@ -88,7 +95,7 @@ class IWSRotateTSimEnv(BaseWorldEnv):
              "--action_mode", self.action_mode, "--max_step", str(self.max_step),
              "--iws_scripts_root", str(IWS_ROOT)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
-            env={**os.environ, "MUJOCO_GL": "egl"},
+            env=server_env,
         )
         return None
 
