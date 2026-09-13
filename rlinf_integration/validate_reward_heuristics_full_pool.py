@@ -91,7 +91,7 @@ def process_episode(env, imgs, n_act):
         k = min(3, n_act)
         last3 = [imgs[j] for j in range(end - k, end)]
         prev_before = float(env.angle_prev[0])
-        angle_end, accepted, morph_detected = env._robust_angle_end(last3, 0)
+        angle_end, accepted, morph_detected, _shrink_detected = env._robust_angle_end(last3, 0)
         log_before = len(env._debug_log)
         per_chunk.append(dict(
             chunk=c, end_frame=end, prev_deg=np.degrees(prev_before),

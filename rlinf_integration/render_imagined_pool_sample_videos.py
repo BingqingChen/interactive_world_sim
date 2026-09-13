@@ -85,7 +85,7 @@ def process_episode_full(env, imgs, n_act, morph_terminate_patience):
         last3 = [imgs[j] for j in range(end - k, end)]
         prev_before = float(env.angle_prev[0])
         log_len_before = len(env._debug_log)
-        angle_end, accepted, morph_detected = env._robust_angle_end(last3, 0)
+        angle_end, accepted, morph_detected, _shrink_detected = env._robust_angle_end(last3, 0)
         debug_kind = None
         if len(env._debug_log) > log_len_before:
             debug_kind = env._debug_log[-1]["kind"]

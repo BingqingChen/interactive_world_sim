@@ -16,12 +16,10 @@ all for this env, avoiding the segfault entirely rather than working around it, 
 is a much simpler class as a result: it is a pure IPC client, no torch-heavy WM
 loading, no angle-estimation logic.
 
-Reset semantics also differ from IWSRotateTWorldEnv: real resets are cheap (no WM
-GPU inference involved), so real_sim_chunk_server.py does true PER-ROW independent
-auto-reset (matching AlohaChunkEnv's own usage convention in
-ppo_residual_rotate_t.py), not the WM env's batch-synchronous reset (which exists
-specifically because regenerating one row's WM video independently mid-batch is
-awkward/expensive -- not a constraint here).
+Reset semantics: real_sim_chunk_server.py does true PER-ROW independent auto-reset
+server-side (matching AlohaChunkEnv's own usage convention in
+ppo_residual_rotate_t.py). IWSRotateTWorldEnv also resets per row, in-process (it
+reset the whole batch until 2026-09-13).
 """
 
 import os
@@ -266,7 +264,7 @@ class IWSRotateTSimEnv(BaseWorldEnv):
             # and next_obs = infos["final_observation"] whenever any row is done
             # -- confirmed via a second real crash (AssertionError in
             # append_transitions) after fixing the first. Unlike
-            # IWSRotateTWorldEnv (batch-sync reset), real_sim_chunk_server.py
+            # IWSRotateTWorldEnv (which resets rows in-process), real_sim_chunk_server.py
             # does per-row auto-reset transparently server-side (see module
             # docstring), so the pre-reset terminal obs isn't naturally
             # available here -- fixed by having the server report BOTH the
@@ -283,6 +281,12 @@ class IWSRotateTSimEnv(BaseWorldEnv):
             infos["final_info"] = dict(infos)
             infos["_final_info"] = done_t
             infos["_final_observation"] = done_t
+            # The server already reset these rows; clear their episode metrics now
+            # that this call's infos hold the finished episodes' values. Without this,
+            # returns summed across a row's successive episodes (env/return drifted
+            # down forever) and success_once stayed True after a row's first success,
+            # so episode metrics counted earlier episodes (found 2026-09-13).
+            self._reset_metrics(env_idx=torch.nonzero(done_t).squeeze(-1))
 
         return ([obs], chunk_rewards, chunk_terminations, chunk_truncations, [infos])
 

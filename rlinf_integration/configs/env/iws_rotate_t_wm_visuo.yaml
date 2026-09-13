@@ -6,7 +6,7 @@ ignore_terminations: True
 use_rel_reward: False
 seed: 0
 group_size: 1
-max_episode_steps: 60  # chunks; must match wm_max_chunks
+max_episode_steps: 40  # chunks; must match wm_max_chunks
 max_steps_per_rollout_epoch: 2
 
 video_cfg:
@@ -17,10 +17,18 @@ enable_offload: False
 
 # IWSRotateTWorldEnv._build_dataset keys.
 n_action_steps: 8
-# Episode cap in chunks. Demo episodes take a median of 36 chunks (p90 54), so the
-# earlier plan's 40 would cut off many feasible successes; 60 covers p90.
-# Degenerate long rollouts are ended by morph_terminate_patience instead.
-wm_max_chunks: 60
+# Episode cap in chunks. Deliberately shorter than the simulator's 100 (user decision
+# 2026-09-13): WM fidelity degrades over long horizons (experiment log §11: at the
+# freeze-frame PSNR floor by frame ~127). 68% of real demos finish within 40 chunks
+# (94.5% within 60); the horizon cut is a truncation, so the critic still bootstraps
+# past it. Earlier WM runs used 60.
+wm_max_chunks: 40
+# Early stop: morph_terminate_patience consecutive bad chunks end the episode, as a
+# truncation. any_reject = rejected read, area growth or area shrink (user decision
+# 2026-09-13); morph_only = area growth only (the earlier rule).
+early_stop_rule: any_reject
+morph_terminate_patience: 3
+stuck_reject_limit: 0  # stuck-prev force-accept disabled; incompatible with any_reject
 wm_ckpt: "/home/jacobhb/projects/worth_doing/interactive_world_sim/ckpts/push_t/epoch=3-step=90000.ckpt"
 wm_config: pusht_mujoco
 dec_infer_steps: 2

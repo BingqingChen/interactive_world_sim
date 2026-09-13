@@ -43,7 +43,16 @@ VARIANTS = {
 }
 
 
-def label_episode(env, imgs, n_act):
+def variant_flags(name, chunks, shrink):
+    """Per-chunk bad flags for a rule. "any_reject_or_shrink" is the rule adopted for the
+    world-model env on 2026-09-13: any_reject plus area shrink below area_ratio_low in
+    any of the chunk's last 3 frames."""
+    if name == "any_reject_or_shrink":
+        return [morph or kind != "ok" or s for (kind, morph, _), s in zip(chunks, shrink)]
+    return [VARIANTS[name](kind, morph) for kind, morph, _ in chunks]
+
+
+def label_episode(env, imgs, n_act, shrink_out=None):
     templates, tc = make_templates(imgs[0], thetas=REWARD_THETAS)
     env._templates = [templates]
     env._tc = [tc]
@@ -61,9 +70,11 @@ def label_episode(env, imgs, n_act):
     for c in range(1, len(imgs) // n_act + 1):
         end = c * n_act
         n_log = len(env._debug_log)
-        angle_end, accepted, morph = env._robust_angle_end(
+        angle_end, accepted, morph, shrink = env._robust_angle_end(
             [imgs[j] for j in range(end - k, end)], 0
         )
+        if shrink_out is not None:
+            shrink_out.append(bool(shrink))
         new_kinds = [d["kind"] for d in env._debug_log[n_log:]]
         assert "stuck_recovery" not in new_kinds
         if accepted:
@@ -114,8 +125,9 @@ def main():
             imgs = z["data/img"][int(starts[ep]):int(ends[ep])]
             if len(imgs) < n_act:
                 continue
-            chunks = label_episode(env, imgs, n_act)
-            episodes.append(dict(zarr=zpath, episode=ep, chunks=chunks))
+            shrink = []
+            chunks = label_episode(env, imgs, n_act, shrink_out=shrink)
+            episodes.append(dict(zarr=zpath, episode=ep, chunks=chunks, shrink=shrink))
             if len(episodes) % 50 == 0:
                 print(f"{len(episodes)} episodes labelled", flush=True)
 
@@ -125,19 +137,20 @@ def main():
     summary = dict(
         patience=patience, n_episodes=len(episodes), total_chunks=total_chunks,
         chunk_kinds=dict(kind_counts), morph_detected_chunks=int(morph_count),
+        shrink_detected_chunks=int(sum(s for e in episodes for s in e["shrink"])),
         thresholds=dict(jump_reject_deg=env.jump_reject_deg, min_iou=env.min_iou,
                         area_ratio=[env.area_ratio_low, env.area_ratio_high],
                         terminal_deg=env.terminal_deg),
         variants={},
     )
 
-    for name, is_bad in VARIANTS.items():
+    for name in [*VARIANTS, "any_reject_or_shrink"]:
         trig_chunks, removed, run_lengths = [], 0, []
         isolated, recovered = 0, 0
         success_eps, cut_before_success = 0, 0
         trigger_patterns = Counter()
         for e in episodes:
-            flags = [is_bad(kind, morph) for kind, morph, _ in e["chunks"]]
+            flags = variant_flags(name, e["chunks"], e["shrink"])
             runs = run_length_stats(flags)
             run_lengths.extend(length for _, length in runs)
             for start, length in runs:
@@ -175,7 +188,8 @@ def main():
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     (out_dir / "episode_labels.json").write_text(json.dumps([
         dict(zarr=e["zarr"], episode=e["episode"],
-             labels=[CODE[kind] + ("m" if morph else "") for kind, morph, _ in e["chunks"]],
+             labels=[CODE[kind] + ("m" if morph else "") + ("s" if s else "")
+                     for (kind, morph, _), s in zip(e["chunks"], e["shrink"])],
              angle_deg=[round(deg, 1) for _, _, deg in e["chunks"]])
         for e in episodes
     ]))

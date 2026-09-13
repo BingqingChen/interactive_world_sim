@@ -14,11 +14,21 @@ Only frame 0 of each episode ever touches real physics (one AlohaEnv reset); eve
 frame after that is pure WM rollout, no resync -- driving the WM open-loop keeps it a
 stationary transition function, which plain SAC/RLPD assumes.
 
-Batch-reset convention: matches RLinf's own WanEnv (rlinf/envs/world_model/world_model_wan_env.py
-_handle_auto_reset) rather than true per-row async reset -- when ANY row in the batch
-finishes (success or step-budget), the WHOLE BATCH resets together. This is RLinf's own
-precedent for world-model envs (regenerating one row's WM video sequence independently
-mid-batch is awkward), not a shortcut invented here.
+Per-row reset: when a row's episode ends (success, step budget or early stop), only that
+row gets a new real reset; the other rows continue to their own normal end. Earlier
+versions reset the WHOLE batch whenever any row finished (following RLinf's WanEnv
+_handle_auto_reset), which cut every other row's episode short; changed 2026-09-13 per
+user decision. Each row keeps its own step counter and WM context. dynamics_forward
+depends only on the context length (a fresh episode's context grows 1 -> 9 -> 10 frames
+over its first chunks), so rows are grouped by that length and a row reset mid-batch sees
+exactly the context imagine_batch would give it.
+
+Early stop (early_stop_rule="any_reject", user decision 2026-09-13): a chunk is bad if its
+angle read is rejected (lost track / low-IoU shape / jump) or the T mask area leaves
+[area_ratio_low, area_ratio_high] x frame 0 in any of the chunk's last 3 frames (growth =
+morph_detected, shrink = shrink_detected). morph_terminate_patience (3) consecutive bad
+chunks end the episode as a TRUNCATION, so the critic still bootstraps from the final
+frame. early_stop_rule="morph_only" restores the earlier rule (area growth only).
 
 Reward mirrors AlohaChunkEnv.step_chunk's formula exactly:
     prog = angle_prev - angle_end
@@ -69,6 +79,7 @@ import eval_metric_correlation as M  # noqa: E402  (load_viz_cfg, load_model)
 from collect_imagined_rotate_t import (  # noqa: E402
     make_templates,
     est_angle_with_conf,
+    red_mask,
     TERMINAL_DEG,
 )
 
@@ -115,8 +126,8 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         package versions identical to IWS's own working venv -- see the plan doc's
         "Blocking issue" section for the full bisection). The server is spawned ONCE
         and answers reset requests for the rest of this env's life -- critical for
-        real training, where batch-synchronous reset (see chunk_step) means every
-        row's episode end triggers a whole-batch reset, so a full run needs on the
+        real training, where every row's episode end triggers a real reset (see
+        chunk_step), so a full run needs on the
         order of 1000+ real resets; a fresh subprocess per reset would pay full
         interpreter-plus-heavy-import startup cost every time, dwarfing the WM's own
         diffusion-sampling cost."""
@@ -155,16 +166,30 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         # degenerate tail from that same calibration (WM frames as low as IoU=0.13).
         self.min_iou = float(cfg.get("min_iou", 0.35))
         # After this many CONSECUTIVE rejected chunks for a row, force-accept the best
-        # available area+IoU-passing candidate even if it fails the jump check --
-        # otherwise a single stale `prev` (e.g. from a transient misread) can poison
-        # the reward for the rest of the episode: every subsequent read also looks
-        # "far from prev" and gets jump-rejected too, since prev is never updated on
-        # reject. Confirmed this actually happened: before the wider REWARD_THETAS fix
-        # (see module docstring), one row's episode got permanently stuck this way
-        # after its first grid-boundary misread.
-        self.stuck_reject_limit = int(cfg.get("stuck_reject_limit", 3))
-        # Consecutive morph_detected chunks required before actually truncating the
-        # episode. REVISED from immediate (patience=1) truncation after validating
+        # available area+IoU-passing candidate even if it fails the jump check (the
+        # "stuck-prev recovery": a stale `prev` from one transient misread otherwise
+        # makes every later read look "far from prev"; it was added for grid-boundary
+        # misreads, which the full-circle REWARD_THETAS since fixed). 0 = disabled,
+        # the default since 2026-09-13: under early_stop_rule="any_reject" the third
+        # consecutive reject ends the episode, and force-accepting it would break the
+        # run of bad chunks before patience is reached.
+        self.stuck_reject_limit = int(cfg.get("stuck_reject_limit", 0))
+        # Which chunks count toward morph_terminate_patience (see module docstring):
+        # "any_reject" -- rejected read, area growth or area shrink (user decision
+        # 2026-09-13); "morph_only" -- area growth only, the earlier rule. On the
+        # 800-episode imagined pool at patience 3 (before shrink was counted;
+        # outputs/reward_reject_patience_full_pool) morph_only cut 21 episodes (2.6%)
+        # and any_reject 85 (10.6%); a visual sample showed the extra cuts are mostly
+        # the T collapsing into an L/V shape (area shrinks, which growth-only morph
+        # detection missed), plus some ambiguous jump streaks.
+        self.early_stop_rule = cfg.get("early_stop_rule", "any_reject")
+        assert self.early_stop_rule in ("any_reject", "morph_only"), self.early_stop_rule
+        assert not (self.early_stop_rule == "any_reject" and self.stuck_reject_limit > 0), (
+            "stuck-prev recovery would force-accept the reject that completes a bad run"
+        )
+        # Consecutive bad chunks (see early_stop_rule) required before truncating the
+        # episode. Evidence for morph_detected alone: REVISED from immediate
+        # (patience=1) truncation after validating
         # against the full 800-episode imagined pool (datasets/scaling_v3/imag/
         # {half1,half2}.zarr): 348/800 episodes (43.5%) had >=1 morph_detected chunk,
         # but only 21/800 (2.6%) ever reached a run of >=3 consecutive morph_detected
@@ -266,62 +291,85 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
     # ------------------------------------------------------------------ reset
     @torch.no_grad()
     def reset(self, *, seed=None, options: Optional[dict] = None):
+        """Full reset: allocate per-row state, then real-reset every row."""
         B, device = self.num_envs, self.device
+        cap = self.wm_max_chunks * self.n_act + self.n_act
+        self.exec_actions_hist = torch.zeros(B, cap, 4, dtype=torch.float32)
+        self.t = np.zeros(B, dtype=np.int64)  # raw WM steps into each row's episode
+        self.steps = np.zeros(B, dtype=np.int64)  # chunks into each row's episode
+        # (B,10,C,H,W), right-aligned: the last z_len[b] frames of row b are valid.
+        self.z_hist = None
+        self.z_len = np.zeros(B, dtype=np.int64)
+        self.prev_img = torch.zeros(B, 3, 128, 128, device=device)
+        self.curr_img = torch.zeros(B, 3, 128, 128, device=device)
+        self.prev_state = torch.zeros(B, 4, device=device)
+        self.curr_state = torch.zeros(B, 4, device=device)
+        # Last commanded EE-xy target per row, for delta-action integration.
+        self.last_target = np.zeros((B, 4), dtype=np.float64)
+        self._templates, self._tc, self._frame0_area = [None] * B, [None] * B, [0] * B
+        self.frame0_u8 = np.zeros((B, 128, 128, 3), dtype=np.uint8)
+        self.angle_prev = torch.zeros(B, dtype=torch.float32)  # upright init => angle 0
+        self._consec_reject = np.zeros(B, dtype=np.int64)  # for the stuck-prev recovery (see stuck_reject_limit)
+        self._consec_bad = np.zeros(B, dtype=np.int64)  # for morph_terminate_patience (see early_stop_rule)
+        # Cumulative diagnostic counters, kept across resets.
+        for name in ("_jump_reject_count", "_lost_track_count", "_morph_reject_count",
+                     "_stuck_recovery_count", "_early_stop_count"):
+            setattr(self, name, getattr(self, name, 0))
+
+        self._reset_metrics()
+        self._reset_rows(np.arange(B))
+        self._is_start = False
+        return self._wrap_obs(), {}
+
+    @torch.no_grad()
+    def _reset_rows(self, rows):
+        """Real-reset only `rows` (np int array) and re-initialize their per-row state;
+        other rows are untouched. The caller resets these rows' episode metrics after
+        it has read the finished episodes' values."""
+        device = self.device
         imgs0, homes, frames0 = [], [], []
-        for _ in range(B):
+        for _ in rows:
             img, home, frame = self._one_real_reset()
             imgs0.append(img)
             homes.append(home)
             frames0.append(frame)
-        img0 = np.stack(imgs0)  # (B,3,128,128) f32 [0,1]
-        home_xy = np.stack(homes).astype(np.float32)  # (B,4)
-        frame0_u8 = np.stack(frames0)  # (B,128,128,3) u8
-
-        f0 = torch.from_numpy(img0).to(device)
+        f0 = torch.from_numpy(np.stack(imgs0)).to(device)  # (R,3,128,128) f32 [0,1]
+        home_xy = np.stack(homes).astype(np.float32)  # (R,4)
         f0n = self.wm.normalizer["top_pov"].normalize(f0)
-        z0 = self.wm.encoder_forward(f0n).to(self.wm.dtype)  # (B,C,H,W)
-        self.z_hist = z0.unsqueeze(1)  # (B,1,C,H,W)
+        z0 = self.wm.encoder_forward(f0n).to(self.wm.dtype)  # (R,C,H,W)
+        if self.z_hist is None:
+            self.z_hist = torch.zeros(
+                self.num_envs, 10, *z0.shape[1:], dtype=z0.dtype, device=z0.device
+            )
+        idx = torch.as_tensor(rows, dtype=torch.long, device=self.z_hist.device)
+        self.z_hist[idx] = 0
+        self.z_hist[idx, -1] = z0
+        self.z_len[rows] = 1
 
-        self.prev_img = f0.clone()
-        self.curr_img = f0.clone()
-        self.prev_state = torch.from_numpy(home_xy).to(device)
-        self.curr_state = self.prev_state.clone()
-
-        cap = self.wm_max_chunks * self.n_act + self.n_act
-        self.exec_actions_hist = torch.zeros(B, cap, 4, dtype=torch.float32)
-        self.t = 0
-        self.steps = 0
-        # Last commanded EE-xy target per row, for delta-action integration
-        # (starts at the settled home pose, like real_sim_chunk_server.reset_row).
-        self.last_target = home_xy.astype(np.float64).copy()
-
-        # per-row template library (each row's own upright frame0 anchors its estimator).
+        idx_dev = torch.as_tensor(rows, dtype=torch.long, device=device)
+        idx_cpu = torch.as_tensor(rows, dtype=torch.long)
+        self.prev_img[idx_dev] = f0
+        self.curr_img[idx_dev] = f0
+        self.prev_state[idx_dev] = torch.from_numpy(home_xy).to(device)
+        self.curr_state[idx_dev] = torch.from_numpy(home_xy).to(device)
+        self.exec_actions_hist[idx_cpu] = 0.0
+        self.t[rows] = 0
+        self.steps[rows] = 0
+        # Starts at the settled home pose, like real_sim_chunk_server.reset_row.
+        self.last_target[rows] = home_xy.astype(np.float64)
+        self.angle_prev[idx_cpu] = 0.0
+        self._consec_reject[rows] = 0
+        self._consec_bad[rows] = 0
+        # Per-row template library (each row's own upright frame0 anchors its estimator).
         # thetas=REWARD_THETAS: full 360 deg grid, wider than the shared module default
         # -- see REWARD_THETAS's docstring for why (RL exploration drives the T past
         # the narrower collection-time grid's -130 deg edge).
-        self._templates, self._tc, self._frame0_area = [], [], []
-        for b in range(B):
-            tpl, tc = make_templates(frame0_u8[b], thetas=REWARD_THETAS)
-            self._templates.append(tpl)
-            self._tc.append(tc)
-            from collect_imagined_rotate_t import red_mask
-            self._frame0_area.append(int(red_mask(frame0_u8[b]).sum()))
-
-        self.angle_prev = torch.zeros(B, dtype=torch.float32)  # upright init => angle 0
-        self._consec_reject = np.zeros(B, dtype=np.int64)  # for the stuck-prev recovery (see stuck_reject_limit)
-        self._consec_morph = np.zeros(B, dtype=np.int64)  # for morph_terminate_patience (see that field's comment)
-        self.frame0_u8 = frame0_u8
-        self._jump_reject_count = getattr(self, "_jump_reject_count", 0)
-        self._lost_track_count = getattr(self, "_lost_track_count", 0)  # no mask / area sanity fail on every candidate frame
-        self._morph_reject_count = getattr(self, "_morph_reject_count", 0)  # mask present & right-sized, but IoU below floor on every candidate frame
-        self._stuck_recovery_count = getattr(self, "_stuck_recovery_count", 0)  # times the stuck-prev escape hatch fired
-        self._morph_terminate_count = getattr(self, "_morph_terminate_count", 0)  # times an episode was force-ended by morph detection
-
-        self._reset_metrics()
-        self._is_start = False
-
-        obs = self._wrap_obs()
-        return obs, {}
+        for i, b in enumerate(rows):
+            tpl, tc = make_templates(frames0[i], thetas=REWARD_THETAS)
+            self._templates[b] = tpl
+            self._tc[b] = tc
+            self._frame0_area[b] = int(red_mask(frames0[i]).sum())
+            self.frame0_u8[b] = frames0[i]
 
     # ------------------------------------------------------------------ obs
     def _wrap_obs(self):
@@ -340,7 +388,8 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
     # -------------------------------------------------------------- reward
     def _robust_angle_end(self, dec_u8_last3, row):
         """dec_u8_last3: list of up-to-3 uint8 (128,128,3) frames (most recent last),
-        for row `row`. Returns (angle_end_rad, accepted: bool, morph_detected: bool).
+        for row `row`. Returns (angle_end_rad, accepted: bool, morph_detected: bool,
+        shrink_detected: bool).
 
         morph_detected specifically means "mask area grew past area_ratio_high" --
         the validated signature of the T deforming into a hallucinated blob (see
@@ -358,9 +407,16 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         reads = []  # (angle, iou) for frames that pass BOTH sanity checks
         any_mask_ok = False  # at least one frame had a plausible-area mask (area check passed)
         morph_detected = False  # at least one frame's area exceeded area_ratio_high
+        # At least one frame's area fell below area_ratio_low, including no mask at all:
+        # the T losing an arm (collapsing into an L/V shape) shrinks the mask, which
+        # growth-only morph detection missed. Counts toward early stop only (user
+        # decision 2026-09-13); the reward does not special-case it.
+        shrink_detected = False
         for frame in dec_u8_last3:
             angle, iou, area = est_angle_with_conf(frame, templates, tc, thetas=REWARD_THETAS)
             raw.append((angle, iou, area))
+            if area < self.area_ratio_low * f0_area:
+                shrink_detected = True
             if angle is None:
                 continue
             if area > self.area_ratio_high * f0_area:
@@ -398,7 +454,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                     raw=raw, f0_area=f0_area, prev_deg=np.degrees(prev),
                     morph_detected=morph_detected,
                 ))
-            return prev, False, morph_detected  # carry forward, not accepted (prog=0 for this chunk)
+            return prev, False, morph_detected, shrink_detected  # carry forward, not accepted (prog=0 for this chunk)
 
         # confidence-weighted median: sort by angle, pick the read whose cumulative
         # IoU-weight crosses the halfway point (a simple, dependency-free weighted
@@ -421,7 +477,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
             # misread) poison the reward for the rest of the episode by making every
             # subsequent read "far from prev" too. We HAVE a plausible candidate here
             # (reads is non-empty) -- after enough consecutive rejects, trust it.
-            if self._consec_reject[row] >= self.stuck_reject_limit:
+            if self.stuck_reject_limit > 0 and self._consec_reject[row] >= self.stuck_reject_limit:
                 self._stuck_recovery_count += 1
                 self._consec_reject[row] = 0
                 if hasattr(self, "_debug_log") and self._debug_log is not None:
@@ -430,7 +486,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                         prev_deg=np.degrees(prev), candidate_deg=np.degrees(candidate),
                         jump_deg=jump_deg,
                     ))
-                return candidate, True, morph_detected
+                return candidate, True, morph_detected, shrink_detected
             self._jump_reject_count += 1
             if hasattr(self, "_debug_log") and self._debug_log is not None:
                 self._debug_log.append(dict(
@@ -438,10 +494,10 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                     prev_deg=np.degrees(prev), candidate_deg=np.degrees(candidate),
                     jump_deg=jump_deg, morph_detected=morph_detected,
                 ))
-            return prev, False, morph_detected
+            return prev, False, morph_detected, shrink_detected
 
         self._consec_reject[row] = 0
-        return candidate, True, morph_detected
+        return candidate, True, morph_detected, shrink_detected
 
     # -------------------------------------------------------------- chunk_step
     @torch.no_grad()
@@ -478,15 +534,36 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                 self.last_target[b] = t_b
             actions = torch.from_numpy(targets.astype(np.float32))
 
-        t = self.t
-        self.exec_actions_hist[:, t : t + n_act] = actions
-        self.exec_actions_hist[:, t + n_act] = actions[:, -1]  # trailing pad
+        for b in range(B):
+            t_b = int(self.t[b])
+            self.exec_actions_hist[b, t_b : t_b + n_act] = actions[b]
+            self.exec_actions_hist[b, t_b + n_act] = actions[b, -1]  # trailing pad
 
-        lo = max(0, t - 9)
-        act_win = self.exec_actions_hist[:, lo : t + n_act + 1].to(device)
-        act_win = self.wm.normalizer["action"].normalize(act_win).to(self.wm.dtype)
-        z_new = self.wm.dynamics_forward(self.z_hist, act_win)  # (B,n_act,C,H,W)
+        # Rows are at different points in their own episodes (per-row reset), so their
+        # WM context lengths differ. dynamics_forward depends only on that length and
+        # the aligned action window (imagine_batch: frames lo..t, lo = max(0, t-9)),
+        # and t has only three regimes -- 0, 8 and >=16 raw steps -- so rows are grouped
+        # by min(t, 16) and each group runs exactly as a same-age imagine_batch would.
+        z_new = None
+        key = np.minimum(self.t, 16)
+        for k in np.unique(key):
+            rows = np.nonzero(key == k)[0]
+            idx = torch.as_tensor(rows, dtype=torch.long, device=self.z_hist.device)
+            L = min(int(k), 9) + 1
+            assert (self.z_len[rows] == L).all(), (int(k), self.z_len[rows])
+            act_win = torch.stack([
+                self.exec_actions_hist[b, max(0, int(self.t[b]) - 9) : int(self.t[b]) + n_act + 1]
+                for b in rows
+            ]).to(device)
+            act_win = self.wm.normalizer["action"].normalize(act_win).to(self.wm.dtype)
+            z_group = self.wm.dynamics_forward(self.z_hist[idx, -L:], act_win)  # (G,n_act,C,H,W)
+            if z_new is None:
+                z_new = torch.empty(
+                    B, *z_group.shape[1:], dtype=z_group.dtype, device=z_group.device
+                )
+            z_new[idx] = z_group
         self.z_hist = torch.cat([self.z_hist, z_new], dim=1)[:, -10:]
+        self.z_len = np.minimum(self.z_len + n_act, 10)
 
         Bn = B * n_act
         dec = render_img_cm(
@@ -498,18 +575,19 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.prev_img = dec[:, -2] if n_act >= 2 else self.curr_img
         self.curr_img = dec[:, -1]
         self.t += n_act
-        t2 = self.t
-        self.prev_state = self.exec_actions_hist[:, t2 - 2].to(device)
-        self.curr_state = self.exec_actions_hist[:, t2 - 1].to(device)
+        rows_all = torch.arange(B)
+        t2 = torch.as_tensor(self.t)
+        self.prev_state = self.exec_actions_hist[rows_all, t2 - 2].to(device)
+        self.curr_state = self.exec_actions_hist[rows_all, t2 - 1].to(device)
         self.steps += 1
 
         k = min(3, n_act)
         rewards_last = torch.zeros(B, dtype=torch.float32, device=device)
         terminations_last = torch.zeros(B, dtype=torch.bool, device=device)
-        morph_terminate = torch.zeros(B, dtype=torch.bool, device=device)
+        early_stop = torch.zeros(B, dtype=torch.bool, device=device)
         for b in range(B):
             last_frames = [dec_u8[b, j] for j in range(n_act - k, n_act)]
-            angle_end, _accepted, morph_detected = self._robust_angle_end(last_frames, b)
+            angle_end, _accepted, morph_detected, shrink_detected = self._robust_angle_end(last_frames, b)
             if morph_detected and _accepted and hasattr(self, "_debug_log") and self._debug_log is not None:
                 # The reject path already logs a "morph" debug_log entry itself; this
                 # covers the accept path (a neighbor frame in the window was valid, but
@@ -548,22 +626,22 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
             # safety property (never credit progress or success from an
             # untrustworthy read, even while the episode is still allowed to
             # continue).
-            if morph_detected:
-                self._consec_morph[b] += 1
+            if self.early_stop_rule == "any_reject":
+                bad = morph_detected or shrink_detected or not _accepted
             else:
-                self._consec_morph[b] = 0
-            morph_terminate[b] = bool(self._consec_morph[b] >= self.morph_terminate_patience)
-        if morph_terminate.any():
-            self._morph_terminate_count = getattr(self, "_morph_terminate_count", 0) + int(morph_terminate.sum())
+                bad = morph_detected
+            self._consec_bad[b] = self._consec_bad[b] + 1 if bad else 0
+            early_stop[b] = bool(self._consec_bad[b] >= self.morph_terminate_patience)
+        if early_stop.any():
+            self._early_stop_count += int(early_stop.sum())
 
-        # Per-row truncation: normal step-budget exhaustion, OR morph detected this
-        # chunk -- per user direction, once the WM has visibly hallucinated the T out
-        # of shape, end the episode rather than continuing to roll out an
-        # uninformative trajectory (a fresh reset gets more useful data per GPU-second
-        # than persisting through a degenerate rollout).
-        truncations_last = (torch.full(
-            (B,), self.steps >= self.wm_max_chunks, dtype=torch.bool, device=device
-        ) | morph_terminate)
+        # Per-row truncation: the row's own step budget, OR early stop (patience
+        # consecutive bad chunks). Both are truncations, not terminations, so the
+        # critic still bootstraps from the final frame -- a user decision
+        # (2026-09-13) kept as an ablation candidate: terminating on early stop would
+        # instead zero the value past a persistent hallucination.
+        horizon_cut = torch.as_tensor(self.steps >= self.wm_max_chunks, device=device)
+        truncations_last = horizon_cut | early_stop
 
         # Width 1 along the chunk axis (= actor.model.num_action_chunks): the whole
         # 8-waypoint chunk is one flat action. env_worker's bootstrap placeholder is
@@ -587,26 +665,27 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         infos["lost_track_count"] = self._lost_track_count
         infos["morph_reject_count"] = self._morph_reject_count
         infos["stuck_recovery_count"] = self._stuck_recovery_count
-        infos["morph_terminate_count"] = self._morph_terminate_count
+        infos["early_stop_count"] = self._early_stop_count
+        # Why each finished row ended (env_worker keeps only done rows' values),
+        # logged as env/early_stop and env/horizon_cut next to env/success.
+        infos["episode"]["early_stop"] = early_stop.float()
+        infos["episode"]["horizon_cut"] = (horizon_cut & ~terminations_last & ~early_stop).float()
 
         if past_dones.any():
-            # Batch-synchronous reset, matching RLinf's own WanEnv._handle_auto_reset
-            # precedent for world-model envs (see module docstring) -- including
-            # infos["final_info"]/"final_observation"/"_final_info"/"_final_observation",
-            # which env_worker.py's env_interact_step unconditionally indexes
-            # (infos["final_info"]["..."]) once ANY row is done, not guarded by an
-            # "in infos" check on that particular line (unlike a neighboring one).
-            # Omitting these crashed the FIRST time any episode actually completed --
-            # not caught by earlier short smoke tests, where episodes hadn't finished
-            # yet (KeyError: 'final_info' in env_worker.py:554, confirmed via two
-            # real training-run crashes).
-            final_info = infos
-            final_obs = pre_reset_obs
-            extracted_obs, infos = self.reset()
-            infos["final_observation"] = final_obs
-            infos["final_info"] = final_info
+            # Per-row reset: only finished rows get a new real reset; the others keep
+            # running. env_worker.py indexes infos["final_info"] and reads
+            # infos["final_observation"] as next_obs whenever any row is done (it
+            # asserts next_obs is not None) -- both crashed earlier runs when missing.
+            # dict(infos), not infos: a self-referential dict crashes with
+            # RecursionError in EnvOutput's nested device walk (as in the sim env).
+            infos["final_observation"] = pre_reset_obs
+            infos["final_info"] = dict(infos)
             infos["_final_info"] = past_dones
             infos["_final_observation"] = past_dones
+            done_rows = torch.nonzero(past_dones).squeeze(-1).cpu().numpy()
+            self._reset_rows(done_rows)
+            self._reset_metrics(env_idx=torch.as_tensor(done_rows, dtype=torch.long, device=device))
+            extracted_obs = self._wrap_obs()
         else:
             extracted_obs = pre_reset_obs
 
