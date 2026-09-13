@@ -182,6 +182,19 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.morph_terminate_patience = int(cfg.get("morph_terminate_patience", 3))
         self.terminal_deg = float(cfg.get("terminal_deg", TERMINAL_DEG))
         self.dec_infer_steps = int(cfg.get("dec_infer_steps", 2))
+        # Recipe parity with IWSRotateTSimEnv (sim runs A/B): "none" = image-only
+        # policy (constant zero state); "delta" = normalized per-step deltas
+        # integrated exactly as real_sim_chunk_server.py does, so the WM still
+        # receives absolute EE-xy targets like the ones it was trained on.
+        self.state_history = cfg.get("state_history", "single")
+        assert self.state_history in ("none", "single")
+        self.action_mode = cfg.get("action_mode", "absolute")
+        assert self.action_mode in ("absolute", "delta")
+        self.max_step = float(cfg.get("max_step", 0.04))
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from real_sim_chunk_server import DEMO_TARGET_LO, DEMO_TARGET_HI
+        self.target_lo = np.array(DEMO_TARGET_LO, np.float64)
+        self.target_hi = np.array(DEMO_TARGET_HI, np.float64)
         x_range = tuple(cfg.get("x_range", (-0.06, 0.06)))
         y_range = tuple(cfg.get("y_range", (-0.06, 0.06)))
         feasible_mask_path = cfg.get(
@@ -273,6 +286,9 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         self.exec_actions_hist = torch.zeros(B, cap, 4, dtype=torch.float32)
         self.t = 0
         self.steps = 0
+        # Last commanded EE-xy target per row, for delta-action integration
+        # (starts at the settled home pose, like real_sim_chunk_server.reset_row).
+        self.last_target = home_xy.astype(np.float64).copy()
 
         # per-row template library (each row's own upright frame0 anchors its estimator).
         # thetas=REWARD_THETAS: full 360 deg grid, wider than the shared module default
@@ -304,12 +320,17 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
 
     # ------------------------------------------------------------------ obs
     def _wrap_obs(self):
-        """Matches this project's own obs-dict convention (diffusion_unet_hybrid_image_policy
-        predict_action / eval_dp_rotate_t.get_obs): {"image": (B,2,3,128,128) f32 [0,1],
-        "agent_pos": (B,2,4) f32}, last axis of the 2-length obs window = most recent."""
-        image = torch.stack([self.prev_img, self.curr_img], dim=1)
-        agent_pos = torch.stack([self.prev_state, self.curr_state], dim=1)
-        return {"image": image, "agent_pos": agent_pos}
+        """RLinf CNNPolicy obs contract, identical to IWSRotateTSimEnv._wrap_obs:
+        main_images (B,128,128,3) in [0,255] (the current decoded frame only),
+        states (B,state_dim). state_history "none" -> a constant zero state, i.e.
+        an image-only policy. (The old {"image","agent_pos"} dict was the
+        diffusion_policy convention and would KeyError inside CNNPolicy.)"""
+        main_images = self.curr_img.float().permute(0, 2, 3, 1) * 255.0
+        if self.state_history == "none":
+            states = torch.zeros(self.num_envs, 1, dtype=torch.float32, device=self.device)
+        else:
+            states = self.curr_state.float()
+        return {"main_images": main_images, "states": states}
 
     # -------------------------------------------------------------- reward
     def _robust_angle_end(self, dec_u8_last3, row):
@@ -430,15 +451,27 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
         rlinf.envs.action_utils.prepare_actions (pass-through for this env type --
         see rlinf_integration/ACTION_UTILS_PATCH.md).
 
-        Returns ([obs], rewards (B,n_act), terminations (B,n_act), truncations (B,n_act),
-        [infos]) -- matches WanEnv.chunk_step's actual return contract exactly (the
-        BaseWorldEnv abstract-method docstring's "(obs, reward, done, info)" is NOT
-        what the real env_worker call site expects; verified against
-        rlinf/workers/env/env_worker.py's chunk_step consumption)."""
+        Returns ([obs], rewards (B,1), terminations (B,1), truncations (B,1), [infos])
+        -- WanEnv.chunk_step's return contract (the BaseWorldEnv abstract-method
+        docstring's "(obs, reward, done, info)" is NOT what env_worker expects), with
+        the chunk axis width equal to actor.model.num_action_chunks=1."""
         B, device, n_act = self.num_envs, self.device, self.n_act
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions, dtype=torch.float32)
         actions = actions.detach().to("cpu", dtype=torch.float32).reshape(B, n_act, 4)
+        if self.action_mode == "delta":
+            # Normalized per-step deltas -> absolute EE-xy targets, integrated and
+            # clipped exactly as real_sim_chunk_server.to_targets does; the WM keeps
+            # receiving absolute targets, the only action form it was trained on.
+            a = actions.numpy().astype(np.float64).clip(-1.0, 1.0) * self.max_step
+            targets = np.empty_like(a)
+            for b in range(B):
+                t_b = self.last_target[b].copy()
+                for k in range(n_act):
+                    t_b = np.clip(t_b + a[b, k], self.target_lo, self.target_hi)
+                    targets[b, k] = t_b
+                self.last_target[b] = t_b
+            actions = torch.from_numpy(targets.astype(np.float32))
 
         t = self.t
         self.exec_actions_hist[:, t : t + n_act] = actions
@@ -514,7 +547,7 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
                 self._consec_morph[b] += 1
             else:
                 self._consec_morph[b] = 0
-            morph_terminate[b] = self._consec_morph[b] >= self.morph_terminate_patience
+            morph_terminate[b] = bool(self._consec_morph[b] >= self.morph_terminate_patience)
         if morph_terminate.any():
             self._morph_terminate_count = getattr(self, "_morph_terminate_count", 0) + int(morph_terminate.sum())
 
@@ -527,12 +560,13 @@ class IWSRotateTWorldEnv(BaseWorldEnv):
             (B,), self.steps >= self.wm_max_chunks, dtype=torch.bool, device=device
         ) | morph_terminate)
 
-        chunk_rewards = torch.zeros(B, n_act, dtype=torch.float32, device=device)
-        chunk_rewards[:, -1] = rewards_last
-        chunk_terminations = torch.zeros(B, n_act, dtype=torch.bool, device=device)
-        chunk_terminations[:, -1] = terminations_last
-        chunk_truncations = torch.zeros(B, n_act, dtype=torch.bool, device=device)
-        chunk_truncations[:, -1] = truncations_last
+        # Width 1 along the chunk axis (= actor.model.num_action_chunks): the whole
+        # 8-waypoint chunk is one flat action. env_worker's bootstrap placeholder is
+        # (B, num_action_chunks), so (B, n_act) tensors crash torch.stack in the
+        # trajectory builder -- the same failure the sim env hit.
+        chunk_rewards = rewards_last.unsqueeze(-1)
+        chunk_terminations = terminations_last.unsqueeze(-1)
+        chunk_truncations = truncations_last.unsqueeze(-1)
 
         past_dones = terminations_last | truncations_last
         pre_reset_obs = self._wrap_obs()
