@@ -60,17 +60,17 @@ class IWSRotateTSimEnv(BaseWorldEnv):
             "feasible_mask", str(IWS_ROOT / "datasets/feasible_mask_v3.json")
         )
         env_seed_base = int(cfg.get("env_seed_base", 42))
-        # "single": main_images/states are RLinf's native format exactly (current
-        # frame only, matching WanEnv._wrap_obs and CNNPolicy.get_dummy_input's
-        # (B,H,W,C) image / (B,state_dim) state contract -- no frame-history dim at
-        # all). "concat_state": same single-frame image, but states is the
-        # concatenation of the previous+current EE-xy (state_dim doubles) to keep
-        # velocity-like information without touching the image channel count (which
-        # would risk breaking the pretrained ResNet encoder's first-conv-layer shape).
-        # Run both side-by-side (2 GPUs available) rather than guess which matters
-        # for this task -- see the plan doc for the reasoning.
+        # Always a single current image. "none": image-only visuomotor policy,
+        # states is (B,0) (needs CNNPolicy's state_dim=0 support). "single" /
+        # "concat_state": latest / previous+latest EE-xy (showed no difference:
+        # 46% vs 44% at N=50).
         self.state_history = cfg.get("state_history", "single")
-        assert self.state_history in ("single", "concat_state")
+        assert self.state_history in ("none", "single", "concat_state")
+        # See real_sim_chunk_server.py: "delta" = normalized per-step deltas
+        # integrated server-side; "absolute" = raw EE-xy targets.
+        self.action_mode = cfg.get("action_mode", "absolute")
+        assert self.action_mode in ("absolute", "delta")
+        self.max_step = float(cfg.get("max_step", 0.04))
 
         # .resolve() is required: this module is loaded via a symlink into
         # ~/RLinf/rlinf/envs/world_model/, and __file__ reports the symlink's own
@@ -85,6 +85,7 @@ class IWSRotateTSimEnv(BaseWorldEnv):
              "--y_min", str(y_range[0]), "--y_max", str(y_range[1]),
              "--feasible_mask", str(feasible_mask_path),
              "--env_seed_base", str(env_seed_base),
+             "--action_mode", self.action_mode, "--max_step", str(self.max_step),
              "--iws_scripts_root", str(IWS_ROOT)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
             env={**os.environ, "MUJOCO_GL": "egl"},
@@ -147,8 +148,13 @@ class IWSRotateTSimEnv(BaseWorldEnv):
 
         if self.state_history == "single":
             states_np = aps[:, -1]  # (B,4)
-        else:  # concat_state
+        elif self.state_history == "concat_state":
             states_np = np.concatenate([aps[:, -2], aps[:, -1]], axis=-1)  # (B,8)
+        else:
+            # Image-only: a constant zero state (state_dim=1). CNNPolicy always has
+            # a state branch; a constant input makes it a fixed learned bias that
+            # carries no robot information, without patching RLinf.
+            states_np = np.zeros((aps.shape[0], 1), np.float32)
         states = torch.from_numpy(states_np).to(self.device)
 
         return {"main_images": main_images, "states": states}
@@ -193,7 +199,8 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         B = actions_np.shape[0]
         actions_np = actions_np.reshape(B, self.n_act, 4)  # (B,1,32) -> (B,8,4) genuine waypoint chunk
 
-        imgs, aps, final_imgs, final_aps, rewards, terminations, truncations, successes = self._send(b"\x02", actions_np)
+        (imgs, aps, final_imgs, final_aps, rewards, terminations, truncations, successes,
+         done_info) = self._send(b"\x02", actions_np)
         obs = self._wrap_obs(imgs, aps)
         device = self.device
         rewards_t = torch.from_numpy(rewards).to(device)
@@ -220,6 +227,23 @@ class IWSRotateTSimEnv(BaseWorldEnv):
         # get a real eval/success (a 0/1 mean = success RATE directly), no
         # RLinf-side (external repo) code touched.
         infos["episode"]["success"] = self.success_once.clone().float()
+        # Failure modes of rows that finished this call (env_worker keeps only the
+        # done rows' values), logged as eval/timeout etc. -- same classification
+        # as evaluate_rlpd_checkpoint.classify.
+        modes = {k: torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+                 for k in ("timeout", "overshoot", "undershoot", "tipped")}
+        for i, r in enumerate(done_info):
+            if r is None or r["success"]:
+                continue
+            if not (r["init_flat"] and r["final_flat"]):
+                modes["tipped"][i] = 1.0
+            elif r["delta_deg"] < -105.0:
+                modes["overshoot"][i] = 1.0
+            elif r["timeout"]:
+                modes["timeout"][i] = 1.0
+            else:
+                modes["undershoot"][i] = 1.0
+        infos["episode"].update(modes)
 
         done_t = term_t | trunc_t
         if done_t.any():

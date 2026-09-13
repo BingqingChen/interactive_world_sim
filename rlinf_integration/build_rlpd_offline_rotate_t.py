@@ -1,48 +1,31 @@
 """Build RLPD's offline demo_buffer from real rotate-T demo data
-(datasets/scaling_v3/real/{A..H}.zarr, 800 episodes total), for condition 2
-(WM-online + real-offline-data RLPD).
+(datasets/scaling_v3/real/{A..H}.zarr, 800 episodes), R episodes per seed on
+disjoint slices [(s-1)*R, s*R) of the A..H-concatenated index -- the BC scaling
+sweep's convention.
 
-Per user direction: since the real zarr shards only store img/action/state
-(no env_state/object pose -- confirmed earlier, and exact sim-replay would
-need the original per-episode collection seed, which isn't recoverable from
-the data alone), the offline reward uses the SAME validated pixel-angle
-heuristic as the online WM env (_robust_angle_end, morph_terminate_patience=3,
-reward=-0.01-on-morph, angle_prev-frozen-on-morph -- see
-world_model_iws_rotate_t_env.py's chunk_step, kept in sync by hand) rather
-than ground-truth eval_success. This was a real, deliberate simplification
-of the original plan (which called for exact ground-truth reward on the
-offline side specifically, accepting an online/offline reward-function
-mismatch as a documented caveat) -- now BOTH sides use the identical reward
-function, so that asymmetry caveat no longer applies. Real (non-hallucinated)
-frames should if anything score better under this estimator than WM frames
-do (confirmed via the full-pool validation: no reason to expect morph/jump
-events on real footage beyond ordinary tracking noise).
+Reward: the same validated pixel-angle heuristic as the online WM env
+(render_imagined_pool_sample_videos.process_episode_full, reused verbatim). The
+zarrs store no object pose and the original collection seeds aren't
+recoverable, so ground-truth sim replay isn't possible. In a *real-sim* RLPD run
+the online reward is ground truth, so online and offline rewards differ there.
 
-Reuses render_imagined_pool_sample_videos.process_episode_full verbatim (same
-reward/accept/morph logic, applied to real frames instead of imagined ones)
--- not reimplemented, to avoid the reward-logic-drift class of bug already
-hit once this session (build_env() silently shadowing a tuned default).
+Actions must match what the online env consumes:
+  --action_mode absolute: flattened (n_act*4) EE-xy targets.
+  --action_mode delta: normalized per-step deltas, a_k = clip((target_k -
+    prev) / max_step, -1, 1), where prev starts at the reset EE-xy (state[0])
+    and is re-integrated exactly as real_sim_chunk_server.py does (clip into
+    the demo box), so reconstruction error can't accumulate.
+Obs: a single current frame, {"main_images": (H,W,3) [0,255], "states"}, with
+states empty for --state_history none.
 
-R=200 per seed, disjoint slices over the combined 800-episode index (shards
-A..H concatenated in that order): seed s -> global episodes
-[(s-1)*200, s*200) -- the same disjoint-per-seed convention the BC scaling
-sweep used (run_scaling_v3_sweep.py).
-
-Packaging: one Trajectory per kept episode (T=that episode's own chunk count
-up to its first termination/truncation, B=1), via
-EmbodiedTrajectoryBuilder + ChunkStepResult, saved through
-TrajectoryReplayBuffer(auto_save=True, trajectory_format="pt") -- the exact
-pattern examples/embodiment/collect_real_data.py uses for its own
-non-rollout-worker offline collection, confirmed via that file, not guessed.
-No separate save_checkpoint() call needed: auto_save writes each trajectory's
-.pt file + metadata.json + trajectory_index.json as add_trajectories() is
-called; buffer.close() flushes the async save executor at the end.
+Packaging follows examples/embodiment/collect_real_data.py: one Trajectory per
+episode (B=1, T = chunks up to the first termination/truncation) through
+EmbodiedTrajectoryBuilder + ChunkStepResult into
+TrajectoryReplayBuffer(auto_save=True, trajectory_format="pt").
 
 Usage:
-  MUJOCO_GL=egl /home/jacobhb/RLinf/.venv/bin/python \
-      rlinf_integration/build_rlpd_offline_rotate_t.py \
-      --seed 1 --state_history single \
-      --out_dir outputs/rlpd_offline_demo_r200_seed1_single
+  MUJOCO_GL=egl ~/RLinf/.venv/bin/python rlinf_integration/build_rlpd_offline_rotate_t.py \
+      --seed 1 --state_history none --action_mode delta
 """
 import argparse
 import sys
@@ -59,6 +42,7 @@ sys.path.insert(0, str(WORKTREE_ROOT / "scripts" / "data_collection"))
 
 from validate_reward_heuristics_full_pool import build_thresholded_env  # noqa: E402
 from render_imagined_pool_sample_videos import process_episode_full  # noqa: E402
+from real_sim_chunk_server import DEMO_TARGET_LO, DEMO_TARGET_HI  # noqa: E402
 
 from rlinf.data.schema.embodied_trajectory_builder import EmbodiedTrajectoryBuilder  # noqa: E402
 from rlinf.data.schema.embodied_types import ChunkStepResult  # noqa: E402
@@ -69,122 +53,112 @@ REAL_ROOT = WORKTREE_ROOT / "datasets" / "scaling_v3" / "real"
 
 
 def build_combined_index():
-    """(shard_letter, local_ep_idx) for global episode index 0..799, shards
-    concatenated in A..H order -- matches the BC sweep's own convention."""
-    index = []
-    zarr_cache = {}
+    index, zarr_cache = [], {}
     for letter in SHARD_LETTERS:
-        zpath = str(REAL_ROOT / f"{letter}.zarr")
-        z = zarr.open(zpath, mode="r")
+        z = zarr.open(str(REAL_ROOT / f"{letter}.zarr"), mode="r")
         zarr_cache[letter] = z
-        n_ep = len(z["meta/episode_ends"][:])
-        for local_ep in range(n_ep):
-            index.append((letter, local_ep))
+        index += [(letter, ep) for ep in range(len(z["meta/episode_ends"][:]))]
     return index, zarr_cache
 
 
-def wrap_obs_single_frame(img_u8, state_row, state_history, prev_state_row=None):
-    """Matches IWSRotateTSimEnv._wrap_obs's RLinf-native contract exactly:
-    main_images (H,W,3) uint8 [0,255], states (state_dim,) f32 -- single
-    current frame, no frame-history dim (image); states optionally
-    concatenates the previous raw step's agent_pos too (concat_state)."""
-    main_images = torch.from_numpy(img_u8.astype(np.float32))  # (H,W,3) [0,255]
+def wrap_obs(img_u8, states_raw, idx, state_history):
+    obs = {"main_images": torch.from_numpy(img_u8.astype(np.float32))}
     if state_history == "single":
-        states = torch.from_numpy(state_row.astype(np.float32))
+        obs["states"] = torch.from_numpy(states_raw[idx].astype(np.float32))
+    elif state_history == "concat_state":
+        obs["states"] = torch.from_numpy(
+            np.concatenate([states_raw[max(0, idx - 1)], states_raw[idx]]).astype(np.float32))
     else:
-        assert prev_state_row is not None
-        states = torch.from_numpy(
-            np.concatenate([prev_state_row, state_row]).astype(np.float32))
-    return {"main_images": main_images, "states": states}
+        obs["states"] = torch.zeros(1, dtype=torch.float32)  # image-only: constant zero state
+    return {k: v.unsqueeze(0) for k, v in obs.items()}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, required=True, choices=[1, 2, 3])
     ap.add_argument("--R", type=int, default=200)
-    ap.add_argument("--state_history", choices=["single", "concat_state"], default="single")
+    ap.add_argument("--state_history", choices=["none", "single", "concat_state"], default="none")
+    ap.add_argument("--action_mode", choices=["absolute", "delta"], default="delta")
+    ap.add_argument("--max_step", type=float, default=0.04)
     ap.add_argument("--out_dir", default=None)
     args = ap.parse_args()
     out_dir = args.out_dir or str(
-        WORKTREE_ROOT / "outputs" / f"rlpd_offline_demo_r{args.R}_seed{args.seed}_{args.state_history}")
+        WORKTREE_ROOT / "outputs" /
+        f"rlpd_offline_demo_r{args.R}_seed{args.seed}_{args.state_history}_{args.action_mode}")
+    lo, hi = np.array(DEMO_TARGET_LO), np.array(DEMO_TARGET_HI)
 
     env = build_thresholded_env()
-    n_act = env.n_act
-    patience = env.morph_terminate_patience
-    print(f"n_act={n_act} morph_terminate_patience={patience} state_history={args.state_history}")
+    n_act, patience = env.n_act, env.morph_terminate_patience
+    print(f"n_act={n_act} patience={patience} state_history={args.state_history} "
+          f"action_mode={args.action_mode} max_step={args.max_step}")
 
     combined_index, zarr_cache = build_combined_index()
-    assert len(combined_index) == 800, f"expected 800 real episodes, got {len(combined_index)}"
-    lo = (args.seed - 1) * args.R
-    hi = lo + args.R
-    picks = combined_index[lo:hi]
-    print(f"seed={args.seed}: global episodes [{lo}, {hi}) -> {len(picks)} episodes")
+    assert len(combined_index) == 800, len(combined_index)
+    lo_ep = (args.seed - 1) * args.R
+    picks = combined_index[lo_ep:lo_ep + args.R]
+    print(f"seed={args.seed}: global episodes [{lo_ep}, {lo_ep + args.R})")
 
-    buffer = TrajectoryReplayBuffer(
-        seed=args.seed, enable_cache=False, auto_save=True,
-        auto_save_path=out_dir, trajectory_format="pt")
+    buffer = TrajectoryReplayBuffer(seed=args.seed, enable_cache=False, auto_save=True,
+                                    auto_save_path=out_dir, trajectory_format="pt")
 
-    n_kept, n_skipped, n_success, n_morph_term, n_natural_end = 0, 0, 0, 0, 0
-    total_chunks = 0
+    n_kept = n_skipped = n_success = n_morph_term = n_natural_end = total_chunks = 0
+    clipped = total_steps = 0
+    max_recon_err = 0.0
     for i, (letter, local_ep) in enumerate(picks):
         z = zarr_cache[letter]
         ends = z["meta/episode_ends"][:]
         starts = np.concatenate([[0], ends[:-1]])
         s, e = int(starts[local_ep]), int(ends[local_ep])
         imgs = z["data/img"][s:e]
-        actions_raw = z["data/action"][s:e]  # (L,4)
-        states_raw = z["data/state"][s:e]    # (L,4) agent_pos
+        actions_raw = z["data/action"][s:e].astype(np.float64)
+        states_raw = z["data/state"][s:e]
         L = len(imgs)
         if L < n_act:
             n_skipped += 1
             continue
-
-        per_chunk, f0_area = process_episode_full(env, imgs, n_act, patience)
+        per_chunk, _ = process_episode_full(env, imgs, n_act, patience)
         if not per_chunk:
             n_skipped += 1
             continue
 
         rollout = EmbodiedTrajectoryBuilder(max_episode_length=len(per_chunk))
+        prev_target = states_raw[0].astype(np.float64)
         prev_frame_idx = 0
         kept = 0
         ended_reason = "natural_end"
         for c in per_chunk:
             end = c["end_frame"]
-            is_last_natural = (end == per_chunk[-1]["end_frame"])
             term = c["success"]
-            trunc = c["morph_terminate"] or (is_last_natural and not term)
+            trunc = c["morph_terminate"] or (end == per_chunk[-1]["end_frame"] and not term)
 
-            action_tensor = torch.from_numpy(
-                actions_raw[end - n_act:end].reshape(-1).astype(np.float32)
-            ).unsqueeze(0)  # (1, 4*n_act) -- matches actor.model.action_dim=32
-            reward_tensor = torch.tensor([[c["reward"]]], dtype=torch.float32)
-            term_tensor = torch.tensor([[term]], dtype=torch.bool)
-            trunc_tensor = torch.tensor([[trunc]], dtype=torch.bool)
-            done_tensor = term_tensor | trunc_tensor
+            chunk_abs = actions_raw[end - n_act:end]
+            if args.action_mode == "delta":
+                chunk_act = np.empty_like(chunk_abs)
+                for k in range(n_act):
+                    raw = (chunk_abs[k] - prev_target) / args.max_step
+                    clipped += int((np.abs(raw) > 1.0).sum())
+                    chunk_act[k] = np.clip(raw, -1.0, 1.0)
+                    prev_target = np.clip(prev_target + chunk_act[k] * args.max_step, lo, hi)
+                    max_recon_err = max(max_recon_err, float(np.abs(prev_target - chunk_abs[k]).max()))
+                total_steps += chunk_abs.size
+            else:
+                chunk_act = chunk_abs
+            action_tensor = torch.from_numpy(chunk_act.reshape(-1).astype(np.float32)).unsqueeze(0)
 
-            step_result = ChunkStepResult(
-                actions=action_tensor, rewards=reward_tensor, dones=done_tensor,
-                terminations=term_tensor, truncations=trunc_tensor,
+            done_tensor = torch.tensor([[term or trunc]], dtype=torch.bool)
+            rollout.append_step_result(ChunkStepResult(
+                actions=action_tensor,
+                rewards=torch.tensor([[c["reward"]]], dtype=torch.float32),
+                dones=done_tensor,
+                terminations=torch.tensor([[term]], dtype=torch.bool),
+                truncations=torch.tensor([[trunc]], dtype=torch.bool),
                 forward_inputs={"action": action_tensor},
-            )
-            rollout.append_step_result(step_result)
-
-            curr_frame_idx = prev_frame_idx
-            curr_prev_state_idx = max(0, curr_frame_idx - 1)
-            next_frame_idx = end - 1
-            next_prev_state_idx = max(0, next_frame_idx - 1)
-            curr_obs = wrap_obs_single_frame(
-                imgs[curr_frame_idx], states_raw[curr_frame_idx], args.state_history,
-                states_raw[curr_prev_state_idx] if args.state_history == "concat_state" else None)
-            next_obs = wrap_obs_single_frame(
-                imgs[next_frame_idx], states_raw[next_frame_idx], args.state_history,
-                states_raw[next_prev_state_idx] if args.state_history == "concat_state" else None)
-            # Unsqueeze to (1, ...) -- EmbodiedTrajectoryBuilder expects per-step
-            # obs dicts shaped (B, ...), B=1 here (one real episode per Trajectory).
-            curr_obs = {k: v.unsqueeze(0) for k, v in curr_obs.items()}
-            next_obs = {k: v.unsqueeze(0) for k, v in next_obs.items()}
-            rollout.append_transitions(curr_obs=curr_obs, next_obs=next_obs)
-
+            ))
+            # action[k] produces frame k+1, so a chunk ending at `end` leaves frame `end`.
+            next_frame_idx = min(end, L - 1)
+            rollout.append_transitions(
+                curr_obs=wrap_obs(imgs[prev_frame_idx], states_raw, prev_frame_idx, args.state_history),
+                next_obs=wrap_obs(imgs[next_frame_idx], states_raw, next_frame_idx, args.state_history))
             prev_frame_idx = next_frame_idx
             kept += 1
             if term:
@@ -197,25 +171,22 @@ def main():
         if kept == 0:
             n_skipped += 1
             continue
-
-        trajectory = rollout.to_trajectory()
-        buffer.add_trajectories([trajectory])
+        buffer.add_trajectories([rollout.to_trajectory()])
         n_kept += 1
         total_chunks += kept
-        if ended_reason == "success":
-            n_success += 1
-        elif ended_reason == "morph_terminate":
-            n_morph_term += 1
-        else:
-            n_natural_end += 1
+        n_success += ended_reason == "success"
+        n_morph_term += ended_reason == "morph_terminate"
+        n_natural_end += ended_reason == "natural_end"
         if (i + 1) % 25 == 0:
             print(f"  [{i+1}/{len(picks)}] kept={n_kept} skipped={n_skipped}")
 
     buffer.close()
     print(f"\nDone. {n_kept} episodes -> {out_dir}")
-    print(f"  skipped (degenerate/too short): {n_skipped}")
-    print(f"  ended in success: {n_success}  morph_terminate: {n_morph_term}  natural/timeout end: {n_natural_end}")
-    print(f"  total chunks (transitions) written: {total_chunks}")
+    print(f"  skipped: {n_skipped}  success: {n_success}  morph_terminate: {n_morph_term}  "
+          f"natural/timeout end: {n_natural_end}  transitions: {total_chunks}")
+    if args.action_mode == "delta":
+        print(f"  delta clipping: {clipped}/{total_steps} action values ({100*clipped/max(total_steps,1):.3f}%), "
+              f"max |reconstructed - demo target| = {max_recon_err:.4f} m")
 
 
 if __name__ == "__main__":
